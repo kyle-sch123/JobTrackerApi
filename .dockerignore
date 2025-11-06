@@ -1,0 +1,12 @@
+**/bin/
+**/obj/
+**/.vs/
+**/.vscode/
+*.user
+*.suo
+*.db
+*.sqlite
+*.log
+.env
+.git
+.gitignore
