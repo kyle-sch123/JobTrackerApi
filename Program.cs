@@ -12,21 +12,16 @@ builder.Services.AddSingleton<JobApplicationService>();
 // Learn more about configuring OpenAPI at https://aka.ms/aspnet/openapi
 builder.Services.AddOpenApi();
 
+
+builder.WebHost.UseUrls("http://0.0.0.0:5000");
+
 builder.Services.AddCors(options =>
 {
-    options.AddPolicy("AllowAll", builder =>
-    {
-        builder.AllowAnyOrigin()
-        .AllowAnyMethod()
-        .AllowAnyHeader();
-    });
-
-    options.AddPolicy("AllowReactApp", builder =>
-    {
-        builder.WithOrigins("http://localhost:3000")
-        .AllowAnyHeader()
-        .AllowAnyMethod();
-    });
+    options.AddPolicy("AllowVercel",
+        policy => policy
+            .WithOrigins("https://jobtracker.vercel.app")
+            .AllowAnyHeader()
+            .AllowAnyMethod());
 });
 
 
@@ -44,7 +39,7 @@ if (app.Environment.IsDevelopment())
 
 app.UseHttpsRedirection();
 
-app.UseCors("AllowReactApp");
+app.UseCors("AllowVercel");
 
 app.UseAuthorization();
 
