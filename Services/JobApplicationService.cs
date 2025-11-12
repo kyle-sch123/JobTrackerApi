@@ -1,93 +1,87 @@
 using JobTrackerApi.Models;
 using Microsoft.Extensions.Options;
 using MongoDB.Driver;
-using MongoDB.Bson;
 
-namespace JobTrackerApi.Services;
-
-public class JobApplicationService
+namespace JobTrackerApi.Services
 {
-    private readonly IMongoCollection<JobApplication> _jobApplicationCollection;
-
-    public JobApplicationService(IOptions<JobApplicationDatabaseSettings> jobTrackerDatabaseSettings)
+    public class JobApplicationService
     {
-        var mongoClient = new MongoClient(jobTrackerDatabaseSettings.Value.ConnectionString);
-        var mongoDatabase = mongoClient.GetDatabase(jobTrackerDatabaseSettings.Value.DatabaseName);
-        _jobApplicationCollection = mongoDatabase.GetCollection<JobApplication>(
-            jobTrackerDatabaseSettings.Value.JobApplicationCollectionName);
-    }
+        private readonly IMongoCollection<JobApplication> _jobApplicationCollection;
 
-    // Get all job applications (sorted by date)
-    public async Task<List<JobApplication>> GetAsync()
-    {
-        return await _jobApplicationCollection
-            .Find(_ => true)
-            .SortByDescending(x => x.applicationDate)
-            .ToListAsync();
-    }
+        public JobApplicationService(IOptions<JobApplicationDatabaseSettings> dbSettings)
+        {
+            var settings = dbSettings.Value;
 
-    // Get all job applications for a specific user (sorted by date)
-    public async Task<List<JobApplication>> GetByUserAsync(string userId)
-    {
-        return await _jobApplicationCollection
-            .Find(x => x.userId == userId)
-            .SortByDescending(x => x.applicationDate)
-            .ToListAsync();
-    }
+            // Use values loaded from .env (via Program.cs)
+            var mongoClient = new MongoClient(settings.ConnectionString);
+            var mongoDatabase = mongoClient.GetDatabase(settings.DatabaseName);
 
-    // Get specific job application by ID
-    public async Task<JobApplication?> GetAsync(string id)
-    {
-        return await _jobApplicationCollection
-            .Find(x => x.Id == id)
-            .FirstOrDefaultAsync();
-    }
+            _jobApplicationCollection = mongoDatabase.GetCollection<JobApplication>(
+                settings.JobApplicationCollectionName
+            );
+        }
 
-    // Create new job application with auto-incrementing jobNumber
-    public async Task CreateAsync(JobApplication newJobApplication)
-    {
-        // Get the highest jobNumber for this user
-        var lastApplication = await _jobApplicationCollection
-            .Find(x => x.userId == newJobApplication.userId)
-            .SortByDescending(x => x.jobNumber)
-            .FirstOrDefaultAsync();
+        // Get all job applications (sorted by date)
+        public async Task<List<JobApplication>> GetAsync() =>
+            await _jobApplicationCollection
+                .Find(_ => true)
+                .SortByDescending(x => x.applicationDate)
+                .ToListAsync();
 
-        // Set jobNumber (start at 1 if no previous applications)
-        newJobApplication.jobNumber = lastApplication != null ? lastApplication.jobNumber + 1 : 1;
+        // Get all job applications for a specific user (sorted by date)
+        public async Task<List<JobApplication>> GetByUserAsync(string userId) =>
+            await _jobApplicationCollection
+                .Find(x => x.userId == userId)
+                .SortByDescending(x => x.applicationDate)
+                .ToListAsync();
 
-        await _jobApplicationCollection.InsertOneAsync(newJobApplication);
-    }
+        // Get specific job application by ID
+        public async Task<JobApplication?> GetAsync(string id) =>
+            await _jobApplicationCollection
+                .Find(x => x.Id == id)
+                .FirstOrDefaultAsync();
 
-    // Update job application
-    public async Task UpdateAsync(string id, JobApplication updatedJobApplication)
-    {
-        await _jobApplicationCollection.ReplaceOneAsync(
-            x => x.Id == id,
-            updatedJobApplication);
-    }
+        // Create new job application with auto-incrementing jobNumber
+        public async Task CreateAsync(JobApplication newJobApplication)
+        {
+            var lastApplication = await _jobApplicationCollection
+                .Find(x => x.userId == newJobApplication.userId)
+                .SortByDescending(x => x.jobNumber)
+                .FirstOrDefaultAsync();
 
-    // Update status only (more efficient)
-    public async Task UpdateStatusAsync(string id, string status, bool autoStatusUpdated = false)
-    {
-        var update = Builders<JobApplication>.Update
-            .Set(x => x.status, status)
-            .Set(x => x.autoStatusUpdated, autoStatusUpdated);
+            newJobApplication.jobNumber = lastApplication != null
+                ? lastApplication.jobNumber + 1
+                : 1;
 
-        await _jobApplicationCollection.UpdateOneAsync(
-            x => x.Id == id,
-            update);
-    }
+            await _jobApplicationCollection.InsertOneAsync(newJobApplication);
+        }
 
-    // Remove specific job application
-    public async Task RemoveAsync(string id)
-    {
-        await _jobApplicationCollection.DeleteOneAsync(x => x.Id == id);
-    }
+        // Update job application
+        public async Task UpdateAsync(string id, JobApplication updatedJobApplication) =>
+            await _jobApplicationCollection.ReplaceOneAsync(
+                x => x.Id == id,
+                updatedJobApplication
+            );
 
-    // Remove all job applications for a user (returns count)
-    public async Task<long> RemoveAllForUserAsync(string userId)
-    {
-        var result = await _jobApplicationCollection.DeleteManyAsync(x => x.userId == userId);
-        return result.DeletedCount;
+        // Update status only (more efficient)
+        public async Task UpdateStatusAsync(string id, string status, bool autoStatusUpdated = false)
+        {
+            var update = Builders<JobApplication>.Update
+                .Set(x => x.status, status)
+                .Set(x => x.autoStatusUpdated, autoStatusUpdated);
+
+            await _jobApplicationCollection.UpdateOneAsync(x => x.Id == id, update);
+        }
+
+        // Remove specific job application
+        public async Task RemoveAsync(string id) =>
+            await _jobApplicationCollection.DeleteOneAsync(x => x.Id == id);
+
+        // Remove all job applications for a user (returns count)
+        public async Task<long> RemoveAllForUserAsync(string userId)
+        {
+            var result = await _jobApplicationCollection.DeleteManyAsync(x => x.userId == userId);
+            return result.DeletedCount;
+        }
     }
 }
