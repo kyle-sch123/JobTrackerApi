@@ -13,9 +13,6 @@ var databaseName = Environment.GetEnvironmentVariable("DatabaseName");
 var jobCollectionName = Environment.GetEnvironmentVariable("JobApplicationCollectionName");
 
 
-
-
-
 // Add them to configuration so they can be used like appsettings.json values
 builder.Configuration["JobApplicationDatabase:ConnectionString"] = connectionString;
 builder.Configuration["JobApplicationDatabase:DatabaseName"] = databaseName;
