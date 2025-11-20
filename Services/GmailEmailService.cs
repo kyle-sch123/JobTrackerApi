@@ -311,5 +311,11 @@ namespace JobTrackerApi.Services
                 .Limit(limit)
                 .ToListAsync();
         }
+
+        // Update existing processed email record
+        public async Task UpdateProcessedEmailAsync(ProcessedEmail email)
+        {
+            await _processedEmailCollection.ReplaceOneAsync(e => e.Id == email.Id, email);
+        }
     }
 }

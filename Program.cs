@@ -2,10 +2,29 @@ using JobTrackerApi.Models;
 using JobTrackerApi.Services;
 using DotNetEnv;
 
+using FirebaseAdmin;
+using Google.Apis.Auth.OAuth2;
+
+using Hangfire;
+using Hangfire.Mongo;
+using Hangfire.Mongo.Migration.Strategies;
+using Hangfire.Mongo.Migration.Strategies.Backup;
+
+using JobTrackerApi.Jobs; // for BackgroundEmailSyncJob
+using JobTrackerApi.Middleware;
+using Hangfire.Dashboard;
+using MongoDB.Driver; // for UseFirebaseAuth middleware
+
 // Load environment variables FIRST, before creating the builder
 Env.Load();
 
 var builder = WebApplication.CreateBuilder(args);
+
+// Enable more verbose logging when running in Development to surface diagnostics
+if (builder.Environment.IsDevelopment())
+{
+    builder.Logging.SetMinimumLevel(Microsoft.Extensions.Logging.LogLevel.Debug);
+}
 
 // Get environment variables
 var connectionString = Environment.GetEnvironmentVariable("ConnectionString");
@@ -28,21 +47,42 @@ builder.Configuration["JobApplicationDatabase:UserEmailConnectionCollectionName"
 builder.Configuration["JobApplicationDatabase:EmailSyncHistoryCollectionName"] = emailSyncHistoryCollectionName;
 builder.Configuration["JobApplicationDatabase:ProcessedEmailCollectionName"] = processedEmailCollectionName;
 
-// Initialize Firebase Admin SDK
-if (!string.IsNullOrEmpty(firebaseProjectId) && 
-    !string.IsNullOrEmpty(firebasePrivateKey) && 
+// Initialize Firebase Admin SDK safely
+if (!string.IsNullOrEmpty(firebaseProjectId) &&
+    !string.IsNullOrEmpty(firebasePrivateKey) &&
     !string.IsNullOrEmpty(firebaseClientEmail))
 {
-    FirebaseApp.Create(new AppOptions
+    var cleanedPrivateKey = firebasePrivateKey
+        .Replace("\\n", "\n")
+        .Replace("\"", "");
+
+    var json = $@"{{
+        ""type"": ""service_account"",
+        ""project_id"": ""{firebaseProjectId}"",
+        ""private_key"": ""{cleanedPrivateKey}"",
+        ""client_email"": ""{firebaseClientEmail}""
+    }}";
+
+    // Use the static CredentialFactory (do NOT instantiate it)
+    var specificCredential = Google.Apis.Auth.OAuth2.CredentialFactory
+        .FromJson<Google.Apis.Auth.OAuth2.ServiceAccountCredential>(json);
+    var credential = specificCredential.ToGoogleCredential();
+
+    if (FirebaseApp.DefaultInstance == null)
     {
-        Credential = GoogleCredential.FromJson($@"{{
-            ""type"": ""service_account"",
-            ""project_id"": ""{firebaseProjectId}"",
-            ""private_key"": ""{firebasePrivateKey.Replace("\\n", "\n")}"",
-            ""client_email"": ""{firebaseClientEmail}""
-        }}")
-    });
+        FirebaseApp.Create(new AppOptions
+        {
+            Credential = credential
+        });
+
+        Console.WriteLine("🔥 Firebase Admin initialized using CredentialFactory.");
+    }
 }
+else
+{
+    Console.WriteLine("❌ Firebase Admin NOT initialized — missing environment vars");
+}
+
 
 // Add services to the container.
 builder.Services.Configure<JobApplicationDatabaseSettings>(builder.Configuration.GetSection("JobApplicationDatabase"));
@@ -52,6 +92,7 @@ builder.Services.AddControllers().AddJsonOptions(options => options.JsonSerializ
 builder.Services.AddSingleton<JobApplicationService>();
 builder.Services.AddSingleton<GmailAuthService>();
 builder.Services.AddSingleton<GmailEmailService>();
+builder.Services.AddSingleton<EmailParserService>();
 builder.Services.AddSingleton<EmailSyncService>();
 
 builder.Services.AddScoped<BackgroundEmailSyncJob>();
@@ -59,25 +100,24 @@ builder.Services.AddScoped<BackgroundEmailSyncJob>();
 //Hangfire configuration
 builder.Services.AddHangfire(config =>
 {
-    var mongoUrlBuilder = new MongoUrlBuilder(connectionString)
-    {
-        DatabaseName = databaseName
-    };
-    
     config
         .SetDataCompatibilityLevel(CompatibilityLevel.Version_180)
         .UseSimpleAssemblyNameTypeSerializer()
         .UseRecommendedSerializerSettings()
-        .UseMongoStorage(mongoUrlBuilder.ToMongoUrl(), new MongoStorageOptions
-        {
-            MigrationOptions = new MongoMigrationOptions
+        .UseMongoStorage(
+            connectionString,       // ✔ string
+            databaseName,           // ✔ string
+            new MongoStorageOptions // ✔ options as 3rd parameter
             {
-                MigrationStrategy = new MigrateMongoMigrationStrategy(),
-                BackupStrategy = new CollectionMongoBackupStrategy()
-            },
-            Prefix = "hangfire",
-            CheckConnection = true
-        });
+                MigrationOptions = new MongoMigrationOptions
+                {
+                    MigrationStrategy = new MigrateMongoMigrationStrategy(),
+                    BackupStrategy = new CollectionMongoBackupStrategy()
+                },
+                Prefix = "hangfire",
+                CheckConnection = true
+            }
+        );
 });
 
 builder.Services.AddHangfireServer(options =>
@@ -112,7 +152,7 @@ if (app.Environment.IsDevelopment())
     });
 }
 
-app.UseHttpsRedirection();
+// app.UseHttpsRedirection();
 
 app.UseCors("AllowAll");
 
@@ -122,12 +162,17 @@ app.UseAuthorization();
 
 app.MapControllers();
 
-// Schedule recurring job for email sync
-var syncIntervalMinutes = int.Parse(Environment.GetEnvironmentVariable("EMAIL_SYNC_INTERVAL_MINUTES") ?? "15");
-RecurringJob.AddOrUpdate<BackgroundEmailSyncJob>(
+var syncIntervalMinutes = int.Parse(
+    Environment.GetEnvironmentVariable("EMAIL_SYNC_INTERVAL_MINUTES") ?? "15"
+);
+
+// Resolve Hangfire job manager from DI
+var recurringJobManager = app.Services.GetRequiredService<IRecurringJobManager>();
+
+recurringJobManager.AddOrUpdate<BackgroundEmailSyncJob>(
     "email-sync-job",
     job => job.ExecuteAsync(),
-    $"*/{syncIntervalMinutes} * * * *" // Every X minutes
+    $"*/{syncIntervalMinutes} * * * *"
 );
 
 app.Run();

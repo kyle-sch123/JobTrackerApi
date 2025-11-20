@@ -6,7 +6,7 @@ namespace JobTrackerApi.Controllers;
 
 [ApiController]
 [Route("api/[controller]")]
-public class JobApplicationController : ControllerBase
+public class JobApplicationController : BaseController
 {
     private readonly JobApplicationService _jobApplicationService;
 

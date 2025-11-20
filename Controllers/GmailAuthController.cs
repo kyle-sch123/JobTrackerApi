@@ -1,4 +1,5 @@
 using JobTrackerApi.Services;
+using System.Text.Json;
 using Microsoft.AspNetCore.Mvc;
 
 namespace JobTrackerApi.Controllers
@@ -29,6 +30,10 @@ namespace JobTrackerApi.Controllers
             try
             {
                 var userId = GetUserId();
+                if (string.IsNullOrEmpty(userId))
+                {
+                    return Unauthorized(new { error = "User not authenticated" });
+                }
                 
                 // Generate a state token for CSRF protection
                 var state = Convert.ToBase64String(Guid.NewGuid().ToByteArray());
@@ -61,10 +66,28 @@ namespace JobTrackerApi.Controllers
 
                 // In production, verify the state token here for CSRF protection
                 
-                // Extract userId from state or require it as a parameter
-                // For now, we'll expect it to be passed from the frontend
+                // Try to get userId from query first (frontend may pass it), otherwise decode it from state
                 var userId = Request.Query["userId"].ToString();
-                
+
+                if (string.IsNullOrEmpty(userId))
+                {
+                    try
+                    {
+                        // state is Base64(JSON { userId, state }) as produced by GetAuthorizationUrl
+                        var stateBase64 = state ?? "";
+                        var decoded = System.Text.Encoding.UTF8.GetString(Convert.FromBase64String(stateBase64));
+                        var doc = System.Text.Json.JsonSerializer.Deserialize<JsonElement>(decoded);
+                        if (doc.ValueKind == System.Text.Json.JsonValueKind.Object && doc.TryGetProperty("userId", out var uidProp))
+                        {
+                            userId = uidProp.GetString();
+                        }
+                    }
+                    catch
+                    {
+                        // ignore decoding errors and fall through to validation
+                    }
+                }
+
                 if (string.IsNullOrEmpty(userId))
                 {
                     return BadRequest(new { error = "User ID is required" });
@@ -102,6 +125,11 @@ namespace JobTrackerApi.Controllers
             try
             {
                 var userId = GetUserId();
+                if (string.IsNullOrEmpty(userId))
+                {
+                    return Unauthorized(new { error = "User not authenticated" });
+                }
+
                 var connection = await _authService.GetConnectionAsync(userId);
 
                 if (connection == null)
@@ -133,6 +161,11 @@ namespace JobTrackerApi.Controllers
             try
             {
                 var userId = GetUserId();
+                if (string.IsNullOrEmpty(userId))
+                {
+                    return Unauthorized(new { error = "User not authenticated" });
+                }
+
                 var success = await _authService.DisconnectAsync(userId);
 
                 if (!success)

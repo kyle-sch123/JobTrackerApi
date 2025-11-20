@@ -2,6 +2,7 @@ using Google.Apis.Auth.OAuth2;
 using Google.Apis.Auth.OAuth2.Flows;
 using Google.Apis.Auth.OAuth2.Responses;
 using Google.Apis.Util.Store;
+using System.Text.Json;
 using JobTrackerApi.Models;
 using Microsoft.Extensions.Options;
 using MongoDB.Driver;
@@ -45,6 +46,10 @@ namespace JobTrackerApi.Services
         public string GetAuthorizationUrl(string userId, string state)
         {
             var scopes = new[] { "https://www.googleapis.com/auth/gmail.readonly" };
+            // Encode userId into the state so it is available on callback without requiring frontend to pass it
+            var stateObj = new { userId = userId ?? "", state = state ?? "" };
+            var stateJson = JsonSerializer.Serialize(stateObj);
+            var stateBase64 = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(stateJson));
 
             var authUrl = $"https://accounts.google.com/o/oauth2/v2/auth?" +
                 $"client_id={Uri.EscapeDataString(_clientId)}&" +
@@ -53,7 +58,7 @@ namespace JobTrackerApi.Services
                 $"scope={Uri.EscapeDataString(string.Join(" ", scopes))}&" +
                 $"access_type=offline&" +
                 $"prompt=consent&" +
-                $"state={Uri.EscapeDataString(state)}";
+                $"state={Uri.EscapeDataString(stateBase64)}";
 
             return authUrl;
         }
