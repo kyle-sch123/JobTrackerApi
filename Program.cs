@@ -15,7 +15,7 @@ using JobTrackerApi.Middleware;
 using Hangfire.Dashboard;
 using MongoDB.Driver; // for UseFirebaseAuth middleware
 
-// Load environment variables FIRST, before creating the builder
+//Loading da environment vars first
 Env.Load();
 
 var builder = WebApplication.CreateBuilder(args);
@@ -84,16 +84,23 @@ else
 }
 
 
-// Add services to the container.
+// Configure services
 builder.Services.Configure<JobApplicationDatabaseSettings>(builder.Configuration.GetSection("JobApplicationDatabase"));
 
 builder.Services.AddControllers().AddJsonOptions(options => options.JsonSerializerOptions.PropertyNamingPolicy = null);
 
+//Existing Services
 builder.Services.AddSingleton<JobApplicationService>();
+
+//Gmail integration services
 builder.Services.AddSingleton<GmailAuthService>();
 builder.Services.AddSingleton<GmailEmailService>();
-builder.Services.AddSingleton<EmailParserService>();
 builder.Services.AddSingleton<EmailSyncService>();
+
+// Add AI processing services
+builder.Services.AddSingleton<ClaudeEmailParserService>();
+builder.Services.AddSingleton<ApplicationMatchingService>();
+builder.Services.AddSingleton<EmailProcessingService>();
 
 builder.Services.AddScoped<BackgroundEmailSyncJob>();
 

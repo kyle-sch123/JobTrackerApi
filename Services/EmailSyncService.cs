@@ -10,7 +10,7 @@ namespace JobTrackerApi.Services
         private readonly IMongoCollection<UserEmailConnection> _connectionCollection;
         private readonly GmailAuthService _authService;
         private readonly GmailEmailService _emailService;
-        private readonly EmailParserService _parserService;
+        private readonly ClaudeEmailParserService _parserService;
         private readonly JobApplicationService _jobService;
         private readonly ILogger<EmailSyncService> _logger;
 
@@ -18,7 +18,7 @@ namespace JobTrackerApi.Services
             IOptions<JobApplicationDatabaseSettings> dbSettings,
             GmailAuthService authService,
             GmailEmailService emailService,
-            EmailParserService parserService,
+            ClaudeEmailParserService parserService,
             JobApplicationService jobService,
             ILogger<EmailSyncService> logger)
         {

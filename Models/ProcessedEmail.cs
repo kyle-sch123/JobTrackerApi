@@ -78,11 +78,20 @@ namespace JobTrackerApi.Models
         [BsonElement("interviewDate")]
         public DateTime? InterviewDate { get; set; }
 
+        [BsonElement("interviewType")]
+        public string? InterviewType {get; set;}
+
         [BsonElement("recruiterName")]
         public string? RecruiterName { get; set; }
 
+        [BsonElement("recruiterEmail")]
+        public string? RecruiterEmail { get; set; }
+
         [BsonElement("jobUrl")]
         public string? JobUrl { get; set; }
+
+        [BsonElement("salaryRange")]
+        public string? SalaryRange {get; set;}
 
         [BsonElement("confidence")]
         public double Confidence { get; set; } = 0.0; // AI confidence score

@@ -3,6 +3,7 @@ using System.Security.Claims;
 
 namespace JobTrackerApi.Controllers
 {
+    
     public class BaseController : ControllerBase
     {
         // Helper to get the current user's Firebase UID from the request

@@ -102,7 +102,7 @@ namespace JobTrackerApi.Services
         private string? ExtractFirstUrl(string text)
         {
             if (string.IsNullOrEmpty(text)) return null;
-            var m = Regex.Match(text, @"https?://[^\s'\">]+", RegexOptions.IgnoreCase);
+            var m = Regex.Match(text, @"https?://[^\s'\>]+", RegexOptions.IgnoreCase);
             return m.Success ? m.Value : null;
         }
 
@@ -139,7 +139,7 @@ namespace JobTrackerApi.Services
         private string Capitalize(string s)
         {
             if (string.IsNullOrEmpty(s)) return s;
-            return Regex.Replace(s.Trim(), "(^|\s)([a-z])", m => m.Groups[1].Value + m.Groups[2].Value.ToUpper());
+            return Regex.Replace(s.Trim(), "(^|\\s)([a-z])", m => m.Groups[1].Value + m.Groups[2].Value.ToUpper());
         }
     }
 }

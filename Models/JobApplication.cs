@@ -38,4 +38,44 @@ public class JobApplication
 
     [BsonElement("autoStatusUpdated")]
     public bool autoStatusUpdated { get; set; } = false;
+
+    // ===== NEW AI-POWERED FIELDS =====
+    [BsonElement("recruiterName")]
+    public string? RecruiterName { get; set; }
+
+    [BsonElement("recruiterEmail")]
+    public string? RecruiterEmail { get; set; }
+
+    [BsonElement("recruiterPhone")]
+    public string? RecruiterPhone { get; set; }
+
+    [BsonElement("interviewDate")]
+    public DateTime? InterviewDate { get; set; }
+
+    [BsonElement("interviewType")]
+    public string? InterviewType { get; set; } // "phone", "video", "onsite"
+
+    [BsonElement("salaryRange")]
+    public string? SalaryRange { get; set; }
+
+    [BsonElement("emailIds")]
+    public List<string>? EmailIds { get; set; } // Links to ProcessedEmail IDs
+
+    [BsonElement("autoCreated")]
+    public bool AutoCreated { get; set; } = false; // Was this created by AI?
+
+    [BsonElement("aiConfidence")]
+    public double? AiConfidence { get; set; } // 0-100 confidence score
+
+    [BsonElement("requiresReview")]
+    public bool RequiresReview { get; set; } = false; // Needs user verification
+
+    [BsonElement("reviewedAt")]
+    public DateTime? ReviewedAt { get; set; } // When user reviewed AI-created app
+
+    [BsonElement("createdAt")]
+    public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+
+    [BsonElement("updatedAt")]
+    public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
 }
