@@ -101,6 +101,8 @@ builder.Services.AddSingleton<EmailSyncService>();
 builder.Services.AddSingleton<ClaudeEmailParserService>();
 builder.Services.AddSingleton<ApplicationMatchingService>();
 builder.Services.AddSingleton<EmailProcessingService>();
+builder.Services.AddSingleton<RuleBasedEmailParser>();
+builder.Services.AddSingleton<HybridEmailParser>();
 
 builder.Services.AddScoped<BackgroundEmailSyncJob>();
 

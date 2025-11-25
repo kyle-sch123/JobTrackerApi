@@ -62,6 +62,9 @@ namespace JobTrackerApi.Models
 
         [BsonElement("extractedData")]
         public EmailExtractedData? ExtractedData { get; set; }
+
+        [BsonElement("extractionMethod")]
+        public string? ExtractionMethod { get; set; }
     }
 
     public class EmailExtractedData
@@ -79,7 +82,7 @@ namespace JobTrackerApi.Models
         public DateTime? InterviewDate { get; set; }
 
         [BsonElement("interviewType")]
-        public string? InterviewType {get; set;}
+        public string? InterviewType { get; set; }
 
         [BsonElement("recruiterName")]
         public string? RecruiterName { get; set; }
@@ -91,9 +94,12 @@ namespace JobTrackerApi.Models
         public string? JobUrl { get; set; }
 
         [BsonElement("salaryRange")]
-        public string? SalaryRange {get; set;}
+        public string? SalaryRange { get; set; }
 
         [BsonElement("confidence")]
         public double Confidence { get; set; } = 0.0; // AI confidence score
+
+        [BsonElement("extractionMethod")]
+        public string ExtractionMethod { get; set; } = "unknown";
     }
 }

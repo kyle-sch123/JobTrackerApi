@@ -7,19 +7,19 @@ namespace JobTrackerApi.Services
     public class EmailProcessingService
     {
         private readonly IMongoCollection<ProcessedEmail> _processedEmailCollection;
-        private readonly ClaudeEmailParserService _parserService;
+        private readonly HybridEmailParser _hybridParser; // CHANGED: Use hybrid parser
         private readonly ApplicationMatchingService _matchingService;
         private readonly JobApplicationService _jobApplicationService;
         private readonly ILogger<EmailProcessingService> _logger;
 
         public EmailProcessingService(
             IOptions<JobApplicationDatabaseSettings> dbSettings,
-            ClaudeEmailParserService parserService,
+            HybridEmailParser hybridParser, // CHANGED: Inject hybrid parser
             ApplicationMatchingService matchingService,
             JobApplicationService jobApplicationService,
             ILogger<EmailProcessingService> logger)
         {
-            _parserService = parserService;
+            _hybridParser = hybridParser;
             _matchingService = matchingService;
             _jobApplicationService = jobApplicationService;
             _logger = logger;
@@ -32,8 +32,8 @@ namespace JobTrackerApi.Services
             );
         }
 
-        // Process a single email with AI
-        public async Task<ProcessingResult> ProcessEmailWithAIAsync(ProcessedEmail email)
+        // Process a single email with hybrid parsing
+        public async Task<ProcessingResult> ProcessEmailWithHybridAsync(ProcessedEmail email, bool forceProcess = false)
         {
             var result = new ProcessingResult
             {
@@ -43,65 +43,64 @@ namespace JobTrackerApi.Services
 
             try
             {
-                _logger.LogInformation($"Processing email {email.GmailMessageId} with AI");
+                _logger.LogInformation($"🔄 Processing email {email.GmailMessageId} (forced: {forceProcess})");
 
-                // Step 1: Parse email with Claude
-                var extractedData = await _parserService.ParseEmailAsync(email);
-                
+                // Step 1: Parse email with HYBRID parser (rule-based → LLM)
+                var extractedData = await _hybridParser.ParseEmailAsync(email);
+
                 result.ExtractedData = extractedData;
                 result.Confidence = extractedData.Confidence;
+                result.ExtractionMethod = extractedData.ExtractionMethod; // NEW: Track method used
 
                 // Update email with extracted data
                 var emailUpdate = Builders<ProcessedEmail>.Update
                     .Set(e => e.ExtractedData, extractedData)
-                    .Set(e => e.AiParsed, true);
+                    .Set(e => e.AiParsed, true)
+                    .Set(e => e.ExtractionMethod, extractedData.ExtractionMethod); // NEW: Store method
 
                 await _processedEmailCollection.UpdateOneAsync(e => e.Id == email.Id, emailUpdate);
 
                 // Step 2: Determine action based on confidence
-                if (_parserService.ShouldAutoProcess(extractedData.Confidence))
+                if (forceProcess || _hybridParser.ShouldAutoProcess(extractedData.Confidence))
                 {
-                    // High confidence - auto create/update
                     result.Action = "auto_processed";
                     await AutoProcessApplication(email, extractedData, result);
                 }
-                else if (_parserService.RequiresReview(extractedData.Confidence))
+                else if (_hybridParser.RequiresReview(extractedData.Confidence))
                 {
-                    // Medium confidence - flag for review
                     result.Action = "requires_review";
                     result.Message = "Extracted data requires user review";
-                    
+
                     var reviewUpdate = Builders<ProcessedEmail>.Update
                         .Set(e => e.ProcessingStatus, "requires_review");
-                    
+
                     await _processedEmailCollection.UpdateOneAsync(e => e.Id == email.Id, reviewUpdate);
                 }
                 else
                 {
-                    // Low confidence - ignore or manual processing
                     result.Action = "low_confidence";
                     result.Message = "Confidence too low for automatic processing";
-                    
+
                     var ignoreUpdate = Builders<ProcessedEmail>.Update
                         .Set(e => e.ProcessingStatus, "ignored");
-                    
+
                     await _processedEmailCollection.UpdateOneAsync(e => e.Id == email.Id, ignoreUpdate);
                 }
 
                 result.Success = true;
                 _logger.LogInformation(
-                    $"Processed email {email.GmailMessageId}: Action={result.Action}, " +
-                    $"Confidence={extractedData.Confidence:F1}%"
+                    $"✅ Processed: Action={result.Action}, Confidence={extractedData.Confidence:F1}%, " +
+                    $"Method={extractedData.ExtractionMethod}"
                 );
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, $"Failed to process email {email.GmailMessageId}");
+                _logger.LogError(ex, $"❌ Failed to process email {email.GmailMessageId}");
                 result.Message = ex.Message;
-                
+
                 var failedUpdate = Builders<ProcessedEmail>.Update
                     .Set(e => e.ProcessingStatus, "failed");
-                
+
                 await _processedEmailCollection.UpdateOneAsync(e => e.Id == email.Id, failedUpdate);
             }
 
@@ -109,13 +108,12 @@ namespace JobTrackerApi.Services
         }
 
         private async Task AutoProcessApplication(
-            ProcessedEmail email, 
+            ProcessedEmail email,
             EmailExtractedData extractedData,
             ProcessingResult result)
         {
-            // Find matching existing application
             var existingApp = await _matchingService.FindMatchingApplicationAsync(
-                email.UserId, 
+                email.UserId,
                 extractedData
             );
 
@@ -123,11 +121,9 @@ namespace JobTrackerApi.Services
 
             if (shouldCreateNew)
             {
-                // Create new job application
                 var newApp = CreateJobApplicationFromEmail(email, extractedData);
                 await _jobApplicationService.CreateAsync(newApp);
 
-                // Link email to job application
                 var emailUpdate = Builders<ProcessedEmail>.Update
                     .Set(e => e.JobApplicationId, newApp.Id)
                     .Set(e => e.ProcessingStatus, "processed");
@@ -136,15 +132,13 @@ namespace JobTrackerApi.Services
 
                 result.JobApplicationId = newApp.Id;
                 result.Message = $"Created new application for {extractedData.CompanyName} - {extractedData.Position}";
-                
-                _logger.LogInformation($"Created job application {newApp.Id} from email {email.GmailMessageId}");
+
+                _logger.LogInformation($"✅ Created job application {newApp.Id} from email {email.GmailMessageId}");
             }
             else if (existingApp != null)
             {
-                // Update existing application
                 await UpdateJobApplicationFromEmail(existingApp, email, extractedData);
 
-                // Link email to job application
                 var emailUpdate = Builders<ProcessedEmail>.Update
                     .Set(e => e.JobApplicationId, existingApp.Id)
                     .Set(e => e.ProcessingStatus, "processed");
@@ -153,82 +147,105 @@ namespace JobTrackerApi.Services
 
                 result.JobApplicationId = existingApp.Id;
                 result.Message = $"Updated application for {extractedData.CompanyName}";
-                
-                _logger.LogInformation($"Updated job application {existingApp.Id} from email {email.GmailMessageId}");
+
+                _logger.LogInformation($"🔄 Updated job application {existingApp.Id} from email {email.GmailMessageId}");
             }
         }
 
         private JobApplication CreateJobApplicationFromEmail(
-            ProcessedEmail email, 
+            ProcessedEmail email,
             EmailExtractedData extractedData)
         {
+            var companyName = extractedData.CompanyName;
+            if (string.IsNullOrWhiteSpace(companyName) || companyName == "Unknown Company")
+            {
+                companyName = $"Company from {email.FromEmail}";
+            }
+
+            var position = extractedData.Position;
+            if (string.IsNullOrWhiteSpace(position))
+            {
+                position = "Position Not Specified";
+            }
+
+            var status = extractedData.ApplicationStatus;
+            if (string.IsNullOrWhiteSpace(status))
+            {
+                status = "Applied";
+            }
+
             return new JobApplication
             {
                 userId = email.UserId,
-                company = extractedData.CompanyName ?? "Unknown",
-                jobTitle = extractedData.Position ?? "Unknown Position",
-                status = extractedData.ApplicationStatus ?? "Applied",
+                company = companyName,
+                jobTitle = position,
+                status = status,
                 applicationDate = email.Date,
-                notes = $"Auto-created from email: {email.Subject}",
-                
-                // New fields from Phase 1
+                notes = $"Auto-created from email: {email.Subject}\n" +
+                       $"Extraction method: {extractedData.ExtractionMethod}\n" +
+                       $"Confidence: {extractedData.Confidence:F0}%\n" +
+                       $"Original From: {email.From}",
+
                 RecruiterName = extractedData.RecruiterName,
-                RecruiterEmail = extractedData.RecruiterEmail,
+                RecruiterEmail = extractedData.RecruiterEmail ?? email.FromEmail,
                 InterviewDate = extractedData.InterviewDate,
                 InterviewType = extractedData.InterviewType,
                 SalaryRange = extractedData.SalaryRange,
                 AutoCreated = true,
                 AiConfidence = extractedData.Confidence,
-                RequiresReview = false,
-                EmailIds = new List<string> { email.Id! }
+                RequiresReview = extractedData.Confidence < 70,
+                EmailIds = new List<string> { email.Id! },
+                CreatedAt = DateTime.UtcNow,
+                UpdatedAt = DateTime.UtcNow
             };
         }
 
         private async Task UpdateJobApplicationFromEmail(
-            JobApplication app, 
-            ProcessedEmail email, 
+            JobApplication app,
+            ProcessedEmail email,
             EmailExtractedData extractedData)
         {
-            // Determine what to update based on extracted data
             var shouldUpdateStatus = ShouldUpdateStatus(app.status, extractedData.ApplicationStatus);
-            
-            if (shouldUpdateStatus)
+
+            if (shouldUpdateStatus && !string.IsNullOrWhiteSpace(extractedData.ApplicationStatus))
             {
-                app.status = extractedData.ApplicationStatus ?? app.status;
+                app.status = extractedData.ApplicationStatus;
                 app.autoStatusUpdated = true;
+                _logger.LogInformation($"Updated status to {extractedData.ApplicationStatus} for application {app.Id}");
             }
 
-            // Update interview details if present
             if (extractedData.InterviewDate.HasValue)
             {
                 app.InterviewDate = extractedData.InterviewDate;
                 app.InterviewType = extractedData.InterviewType;
             }
 
-            // Update recruiter info if present
-            if (!string.IsNullOrEmpty(extractedData.RecruiterName))
+            if (!string.IsNullOrEmpty(extractedData.RecruiterName) && string.IsNullOrEmpty(app.RecruiterName))
             {
                 app.RecruiterName = extractedData.RecruiterName;
             }
 
-            if (!string.IsNullOrEmpty(extractedData.RecruiterEmail))
+            if (!string.IsNullOrEmpty(extractedData.RecruiterEmail) && string.IsNullOrEmpty(app.RecruiterEmail))
             {
                 app.RecruiterEmail = extractedData.RecruiterEmail;
             }
 
-            // Add email ID to tracking
             if (app.EmailIds == null)
             {
                 app.EmailIds = new List<string>();
             }
-            
+
             if (!app.EmailIds.Contains(email.Id!))
             {
                 app.EmailIds.Add(email.Id!);
             }
 
-            // Append notes
-            var noteAddition = $"\n[AI Update {DateTime.UtcNow:yyyy-MM-dd}]: {email.Subject}";
+            app.UpdatedAt = DateTime.UtcNow;
+
+            var noteAddition = $"\n[Hybrid Update {DateTime.UtcNow:yyyy-MM-dd HH:mm}]: " +
+                              $"Status={extractedData.ApplicationStatus}, " +
+                              $"Confidence={extractedData.Confidence:F0}%, " +
+                              $"Method={extractedData.ExtractionMethod}";
             app.notes = (app.notes ?? "") + noteAddition;
 
             await _jobApplicationService.UpdateAsync(app.Id!, app);
@@ -238,7 +255,6 @@ namespace JobTrackerApi.Services
         {
             if (string.IsNullOrEmpty(newStatus)) return false;
 
-            // Status progression rules
             var statusHierarchy = new Dictionary<string, int>
             {
                 { "Applied", 1 },
@@ -253,37 +269,45 @@ namespace JobTrackerApi.Services
             var currentLevel = statusHierarchy.GetValueOrDefault(currentStatus, 0);
             var newLevel = statusHierarchy.GetValueOrDefault(newStatus, 0);
 
-            // Only update if new status is more advanced (except rejection can happen anytime)
             return newStatus == "Rejected" || newLevel > currentLevel;
         }
 
-        // Process all pending emails for a user
         public async Task<List<ProcessingResult>> ProcessPendingEmailsAsync(string userId)
         {
             var results = new List<ProcessingResult>();
 
             var pendingEmails = await _processedEmailCollection
-                .Find(e => e.UserId == userId && 
-                          e.IsJobRelated && 
+                .Find(e => e.UserId == userId &&
+                          e.IsJobRelated &&
                           !e.AiParsed &&
                           e.ProcessingStatus == "pending")
                 .ToListAsync();
 
-            _logger.LogInformation($"Processing {pendingEmails.Count} pending emails for user {userId}");
+            _logger.LogInformation($"📧 Processing {pendingEmails.Count} pending emails for user {userId}");
 
             foreach (var email in pendingEmails)
             {
-                var result = await ProcessEmailWithAIAsync(email);
+                var result = await ProcessEmailWithHybridAsync(email);
                 results.Add(result);
 
-                // Small delay to avoid rate limiting
                 await Task.Delay(500);
             }
+
+            // Log statistics
+            var ruleBasedCount = results.Count(r => r.ExtractedData?.ExtractionMethod == "rule-based");
+            var refinedCount = results.Count(r => r.ExtractedData?.ExtractionMethod == "hybrid-refined");
+            var llmFullCount = results.Count(r => r.ExtractedData?.ExtractionMethod == "llm-full");
+
+            _logger.LogInformation(
+                $"✅ Completed: {results.Count} total, " +
+                $"Rule-based: {ruleBasedCount} ({ruleBasedCount * 100.0 / results.Count:F0}%), " +
+                $"Refined: {refinedCount}, " +
+                $"LLM-full: {llmFullCount}"
+            );
 
             return results;
         }
 
-        // Get emails that require manual review
         public async Task<List<ProcessedEmail>> GetEmailsRequiringReviewAsync(string userId)
         {
             return await _processedEmailCollection
@@ -291,16 +315,88 @@ namespace JobTrackerApi.Services
                 .SortByDescending(e => e.Date)
                 .ToListAsync();
         }
+
+        public async Task<ProcessedEmail?> GetEmailByIdAsync(string emailId, string userId)
+        {
+            return await _processedEmailCollection
+                .Find(e => e.Id == emailId && e.UserId == userId)
+                .FirstOrDefaultAsync();
+        }
+
+        public async Task<object> GetProcessingStatsAsync(string userId)
+        {
+            var allEmails = await _processedEmailCollection
+                .Find(e => e.UserId == userId)
+                .ToListAsync();
+
+            var jobRelatedEmails = allEmails.Where(e => e.IsJobRelated).ToList();
+
+            return new
+            {
+                totalEmails = allEmails.Count,
+                jobRelatedEmails = jobRelatedEmails.Count,
+                aiParsed = jobRelatedEmails.Count(e => e.AiParsed),
+                pending = jobRelatedEmails.Count(e => e.ProcessingStatus == "pending"),
+                processed = jobRelatedEmails.Count(e => e.ProcessingStatus == "processed"),
+                requiresReview = jobRelatedEmails.Count(e => e.ProcessingStatus == "requires_review"),
+                ignored = jobRelatedEmails.Count(e => e.ProcessingStatus == "ignored"),
+                failed = jobRelatedEmails.Count(e => e.ProcessingStatus == "failed"),
+                averageConfidence = jobRelatedEmails.Where(e => e.ExtractedData != null)
+                    .Select(e => e.ExtractedData!.Confidence)
+                    .DefaultIfEmpty(0)
+                    .Average(),
+                breakdown = new
+                {
+                    highConfidence = jobRelatedEmails.Count(e => e.ExtractedData != null && e.ExtractedData.Confidence >= 70),
+                    mediumConfidence = jobRelatedEmails.Count(e => e.ExtractedData != null && e.ExtractedData.Confidence >= 40 && e.ExtractedData.Confidence < 70),
+                    lowConfidence = jobRelatedEmails.Count(e => e.ExtractedData != null && e.ExtractedData.Confidence < 40)
+                },
+                extractionMethods = new
+                {
+                    ruleBased = jobRelatedEmails.Count(e => e.ExtractionMethod == "rule-based"),
+                    hybridRefined = jobRelatedEmails.Count(e => e.ExtractionMethod == "hybrid-refined"),
+                    llmFull = jobRelatedEmails.Count(e => e.ExtractionMethod == "llm-full")
+                }
+            };
+        }
+
+        public async Task<bool> MarkEmailAsIgnoredAsync(string emailId, string userId)
+        {
+            var update = Builders<ProcessedEmail>.Update
+                .Set(e => e.ProcessingStatus, "ignored");
+
+            var result = await _processedEmailCollection.UpdateOneAsync(
+                e => e.Id == emailId && e.UserId == userId,
+                update
+            );
+
+            return result.ModifiedCount > 0;
+        }
+
+        public async Task<bool> UpdateExtractedDataAsync(string emailId, string userId, EmailExtractedData extractedData)
+        {
+            var update = Builders<ProcessedEmail>.Update
+                .Set(e => e.ExtractedData, extractedData)
+                .Set(e => e.AiParsed, true);
+
+            var result = await _processedEmailCollection.UpdateOneAsync(
+                e => e.Id == emailId && e.UserId == userId,
+                update
+            );
+
+            return result.ModifiedCount > 0;
+        }
     }
 
     public class ProcessingResult
     {
         public string EmailId { get; set; } = null!;
         public bool Success { get; set; }
-        public string Action { get; set; } = null!; // "auto_processed", "requires_review", "low_confidence"
+        public string Action { get; set; } = null!;
         public string? Message { get; set; }
         public string? JobApplicationId { get; set; }
         public EmailExtractedData? ExtractedData { get; set; }
         public double Confidence { get; set; }
+        public string? ExtractionMethod { get; set; } // NEW: Track which method was used
     }
 }
