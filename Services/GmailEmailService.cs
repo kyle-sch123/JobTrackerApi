@@ -251,6 +251,8 @@ namespace JobTrackerApi.Services
             // Combine with OR
             var mainQuery = string.Join(" OR ", queries);
 
+            mainQuery += " category:primary in:inbox";
+
             // Add date filter if provided
             if (since.HasValue)
             {
