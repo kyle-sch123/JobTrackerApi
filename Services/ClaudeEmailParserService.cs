@@ -1,5 +1,6 @@
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using JobTrackerApi.Models;
 
@@ -25,7 +26,7 @@ namespace JobTrackerApi.Services
             _httpClient.DefaultRequestHeaders.Add("anthropic-version", "2023-06-01");
 
             _model = Environment.GetEnvironmentVariable("CLAUDE_MODEL")
-                ?? "claude-3-5-sonnet-20241022"; // Using Sonnet for better accuracy
+                ?? "claude-3-5-sonnet-20241022";
 
             _maxTokens = int.Parse(Environment.GetEnvironmentVariable("CLAUDE_MAX_TOKENS") ?? "1024");
         }
@@ -43,18 +44,24 @@ namespace JobTrackerApi.Services
                     model = _model,
                     max_tokens = _maxTokens,
                     temperature = 0.2,
-                    system = @"You are an expert at extracting job application data from emails.
-        CRITICAL: Always extract the position/role name from phrases like 'application for [Position]' or 'applied to [Position]'.
-        Look for company names in signatures, footers, or email addresses.
-        Return valid JSON with ALL fields present (use null for missing data).",
+                    system = @"You are an expert at identifying and extracting job application data from emails.
+
+CRITICAL RULES:
+1. Only extract data from ACTUAL job application confirmation/response emails
+2. IGNORE: newsletters, job posting notifications, marketing emails, job alerts
+3. Valid emails: application confirmations, interview invitations, rejection letters, offer letters
+4. Return isJobApplication=false for non-application emails
+5. Extract position from 'application for [Position]' or 'applied to [Position]' patterns
+6. Look for company names in signatures, footers, or email addresses
+7. Return valid JSON with ALL fields present (use null for missing data)",
                     messages = new[]
                     {
-                                new
-                                {
-                                    role = "user",
-                                    content = prompt
-                                }
-                            }
+                        new
+                        {
+                            role = "user",
+                            content = prompt
+                        }
+                    }
                 };
 
                 var json = JsonSerializer.Serialize(requestBody);
@@ -62,22 +69,22 @@ namespace JobTrackerApi.Services
 
                 var response = await _httpClient.PostAsync("https://api.anthropic.com/v1/messages", content);
 
-                // Log the full response for debugging
                 var responseContent = await response.Content.ReadAsStringAsync();
                 _logger.LogInformation($"📥 Claude API Status: {response.StatusCode}");
-                _logger.LogInformation($"📥 Claude API Full Response: {responseContent.Substring(0, Math.Min(500, responseContent.Length))}");
+                _logger.LogInformation($"📥 Claude API Response: {responseContent.Substring(0, Math.Min(1000, responseContent.Length))}");
 
                 if (!response.IsSuccessStatusCode)
                 {
                     _logger.LogError($"❌ Claude API error: {response.StatusCode} - {responseContent}");
                     return CreateFallbackExtraction(email);
                 }
+
                 var claudeResponse = JsonSerializer.Deserialize<ClaudeApiResponse>(responseContent);
-
                 var text = ExtractText(claudeResponse);
-                var jsonText = ExtractJsonFromText(text);
 
-                _logger.LogInformation($"🤖 Claude raw response: {text.Substring(0, Math.Min(200, text.Length))}...");
+                _logger.LogInformation($"🤖 Claude raw response: {text}");
+
+                var jsonText = ExtractJsonFromText(text);
                 _logger.LogInformation($"📝 Extracted JSON: {jsonText}");
 
                 var extracted = JsonSerializer.Deserialize<EmailExtractedData>(
@@ -91,8 +98,19 @@ namespace JobTrackerApi.Services
                     return CreateFallbackExtraction(email);
                 }
 
+                // Check if this is actually a job application email
+                if (!extracted.IsJobApplication)
+                {
+                    _logger.LogInformation($"🚫 Email {email.GmailMessageId} is not a job application (newsletter/alert/posting)");
+                    extracted.Confidence = 0;
+                    return extracted;
+                }
+
                 // Post-process and validate
                 PostProcessExtractedData(extracted, email);
+
+                // Set description
+                extracted.Description = "Automatically created from your email via AI";
 
                 _logger.LogInformation(
                     $"✅ Successfully parsed: Company='{extracted.CompanyName}', " +
@@ -109,8 +127,6 @@ namespace JobTrackerApi.Services
             }
         }
 
-
-        // Add this method to ClaudeEmailParserService.cs
         public async Task<EmailExtractedData> ParseEmailWithPromptAsync(ProcessedEmail email, string customPrompt)
         {
             try
@@ -124,12 +140,12 @@ namespace JobTrackerApi.Services
                     temperature = 0.2,
                     messages = new[]
                     {
-                new
-                {
-                    role = "user",
-                    content = customPrompt
-                }
-            }
+                        new
+                        {
+                            role = "user",
+                            content = customPrompt
+                        }
+                    }
                 };
 
                 var json = JsonSerializer.Serialize(requestBody);
@@ -156,6 +172,7 @@ namespace JobTrackerApi.Services
                 if (extracted != null)
                 {
                     PostProcessExtractedData(extracted, email);
+                    extracted.Description = "Automatically created from your email via AI";
                     return extracted;
                 }
 
@@ -177,17 +194,29 @@ namespace JobTrackerApi.Services
             }
             data.Confidence = Math.Clamp(data.Confidence, 0, 100);
 
-            // 2. Fix company name if missing or generic
+            // 2. Handle company name
             if (string.IsNullOrWhiteSpace(data.CompanyName) ||
                 data.CompanyName.Equals("Unknown", StringComparison.OrdinalIgnoreCase) ||
                 data.CompanyName.Equals("Unknown Company", StringComparison.OrdinalIgnoreCase))
             {
-                data.CompanyName = ExtractCompanyFromEmail(email);
+                var extractedCompany = ExtractCompanyFromEmail(email);
+
+                // Check if it's from a recruitment platform
+                if (IsRecruitmentPlatform(email.FromEmail) || extractedCompany == "Unknown Company")
+                {
+                    data.CompanyName = DetermineRecruitmentSource(email);
+                    _logger.LogInformation($"🔍 Recruitment platform detected: '{data.CompanyName}'");
+                }
+                else
+                {
+                    data.CompanyName = extractedCompany;
+                }
+
                 data.Confidence = Math.Max(0, data.Confidence - 15);
                 _logger.LogInformation($"🔍 Fallback company extraction: '{data.CompanyName}'");
             }
 
-            // 3. Fix position if missing - CRITICAL FOR YOUR CASE
+            // 3. Fix position if missing
             if (string.IsNullOrWhiteSpace(data.Position))
             {
                 data.Position = ExtractPositionFromEmail(email);
@@ -208,12 +237,62 @@ namespace JobTrackerApi.Services
             data.CompanyName = CleanCompanyName(data.CompanyName);
         }
 
+        private bool IsRecruitmentPlatform(string email)
+        {
+            var recruitmentDomains = new[]
+            {
+                "pnet.co.za", "indeed.com", "linkedin.com", "glassdoor.com",
+                "bamboohr.com", "workday.com", "greenhouse.io", "lever.co",
+                "smartrecruiters.com", "jobvite.com", "talentsoft.com",
+                "careers.page", "myworkdayjobs.com", "icims.com"
+            };
+
+            return recruitmentDomains.Any(domain => email.ToLower().Contains(domain));
+        }
+
+        private string DetermineRecruitmentSource(ProcessedEmail email)
+        {
+            var emailLower = email.FromEmail.ToLower();
+
+            if (emailLower.Contains("pnet.co.za"))
+                return "PNet Job Application";
+            if (emailLower.Contains("indeed.com"))
+                return "Indeed Job Application";
+            if (emailLower.Contains("linkedin.com"))
+                return "LinkedIn Job Application";
+            if (emailLower.Contains("bamboohr.com") || emailLower.Contains("workday") ||
+                emailLower.Contains("greenhouse") || emailLower.Contains("lever"))
+                return "Recruitment Agency (ATS)";
+            if (emailLower.Contains("glassdoor"))
+                return "Glassdoor Job Application";
+
+            // Try to extract agency/company name from subject or body
+            var agencyName = ExtractAgencyFromContent(email);
+            if (!string.IsNullOrEmpty(agencyName))
+                return agencyName;
+
+            return "Recruitment Agency";
+        }
+
+        private string ExtractAgencyFromContent(ProcessedEmail email)
+        {
+            var content = $"{email.Subject} {email.BodyPlainText ?? email.BodyHtml ?? ""}";
+
+            // Look for "on behalf of" patterns
+            var behalfMatch = Regex.Match(content, @"on behalf of\s+([A-Z][A-Za-z\s&]+?)(?:\.|,|\s+for)", RegexOptions.IgnoreCase);
+            if (behalfMatch.Success && behalfMatch.Groups[1].Value.Length > 2)
+            {
+                return behalfMatch.Groups[1].Value.Trim();
+            }
+
+            return string.Empty;
+        }
+
         private string ExtractPositionFromEmail(ProcessedEmail email)
         {
             var content = $"{email.Subject} {email.BodyPlainText ?? email.BodyHtml ?? email.Snippet}";
 
             // Pattern 1: Extract from subject line first (most reliable)
-            // Format: "Thanks for applying | Frontend Developer | JO-123"
             var subjectPipeMatch = Regex.Match(email.Subject, @"\|\s*([^|]+?)\s*\|", RegexOptions.IgnoreCase);
             if (subjectPipeMatch.Success && subjectPipeMatch.Groups[1].Success)
             {
@@ -225,7 +304,7 @@ namespace JobTrackerApi.Services
                 }
             }
 
-            // Pattern 2: "application for [Position]"
+            // Pattern 2: Common application phrases
             var patterns = new[]
             {
                 @"application for\s+(?:the\s+)?([^.!,\n]+?)(?:\s+has\s+been|\s+to|\.|!|,)",
@@ -234,7 +313,6 @@ namespace JobTrackerApi.Services
                 @"position[:\s]+([A-Z][^.!,\n]+?)(?:\s+at|\.|!|,)",
                 @"role[:\s]+([A-Z][^.!,\n]+?)(?:\s+at|\.|!|,)",
                 @"as\s+(?:a|an)\s+([A-Z][^.!,\n]+?)(?:\s+at|\s+with|\.|!|,)",
-                // Common job title patterns
                 @"((?:Senior|Junior|Lead|Principal|Staff)?\s*(?:Software|Front\s*End|Back\s*End|Full\s*Stack|Web|Mobile|Data|DevOps|Cloud)\s+(?:Engineer|Developer|Architect|Designer|Analyst|Manager))",
             };
 
@@ -244,25 +322,13 @@ namespace JobTrackerApi.Services
                 if (match.Success && match.Groups[1].Success)
                 {
                     var position = match.Groups[1].Value.Trim();
-                    // Clean up the position
                     position = position.Replace("  ", " ").Trim();
 
                     if (position.Length > 3 && position.Length < 100)
                     {
-                        _logger.LogInformation($"🎯 Extracted position from pattern '{pattern}': '{position}'");
+                        _logger.LogInformation($"🎯 Extracted position from pattern: '{position}'");
                         return position;
                     }
-                }
-            }
-
-            // If still nothing, try simple subject extraction
-            var simpleSubjectMatch = Regex.Match(email.Subject, @"(?:for|regarding|re:)\s+([^-|]+)", RegexOptions.IgnoreCase);
-            if (simpleSubjectMatch.Success)
-            {
-                var position = simpleSubjectMatch.Groups[1].Value.Trim();
-                if (position.Length > 3 && position.Length < 100)
-                {
-                    return position;
                 }
             }
 
@@ -335,11 +401,12 @@ namespace JobTrackerApi.Services
             {
                 var domain = email.Split('@').LastOrDefault()?.ToLower() ?? "";
 
-                // Skip generic domains
+                // Skip generic/recruitment domains
                 var genericDomains = new[]
                 {
                     "bamboohr.com", "workday.com", "greenhouse.io", "lever.co",
-                    "gmail.com", "yahoo.com", "outlook.com", "pnet.co.za", "indeed.com"
+                    "gmail.com", "yahoo.com", "outlook.com", "pnet.co.za", "indeed.com",
+                    "linkedin.com", "glassdoor.com", "smartrecruiters.com"
                 };
 
                 if (genericDomains.Any(d => domain.Contains(d)))
@@ -385,22 +452,27 @@ namespace JobTrackerApi.Services
             if (Regex.IsMatch(content, @"reviewing|under review|next steps|considering|evaluating|in process"))
                 return "In Progress";
 
-            return "Applied"; // Default
+            return "Applied";
         }
 
         private string CleanCompanyName(string companyName)
         {
             if (string.IsNullOrWhiteSpace(companyName)) return "Unknown Company";
 
-            // Remove common suffixes
             companyName = Regex.Replace(companyName, @"\s+(Inc\.?|LLC|Ltd\.?|Corp\.?|Corporation|Limited)$", "", RegexOptions.IgnoreCase);
-
             return companyName.Trim();
         }
 
         private EmailExtractedData CreateFallbackExtraction(ProcessedEmail email)
         {
             var companyName = ExtractCompanyFromEmail(email);
+
+            // Check if it's from a recruitment platform
+            if (IsRecruitmentPlatform(email.FromEmail) || companyName == "Unknown Company")
+            {
+                companyName = DetermineRecruitmentSource(email);
+            }
+
             var position = ExtractPositionFromEmail(email);
             var status = DetectStatusFromEmail(email);
 
@@ -414,8 +486,10 @@ namespace JobTrackerApi.Services
                 CompanyName = companyName,
                 Position = position,
                 ApplicationStatus = status,
-                Confidence = 30, // Low confidence for complete fallback
-                RecruiterEmail = email.FromEmail
+                Confidence = 30,
+                RecruiterEmail = email.FromEmail,
+                IsJobApplication = true,
+                Description = "Automatically created from your email via AI"
             };
         }
 
@@ -431,19 +505,38 @@ namespace JobTrackerApi.Services
             if (body.Length > 4000)
                 body = body[..4000] + "...";
 
-            return $@"Extract job application information from this email. 
+            return $@"Analyze this email and determine if it's a legitimate job application response email.
 
-CRITICAL INSTRUCTIONS:
-1. Look for position/role in phrases like ""application for [POSITION]"" or ""applied to [POSITION]""
-2. Extract company name from signature, footer, or email metadata
-3. For rejection emails (keywords: unfortunately, not proceeding, other candidates), set status to 'Rejected' with high confidence
-4. ALL fields must be present in JSON (use null if truly not found)
+CRITICAL CLASSIFICATION:
+1. IS a job application email:
+   - Application confirmation (""we received your application"")
+   - Interview invitation/scheduling
+   - Rejection notification
+   - Offer letter
+   - Application status update
+
+2. NOT a job application email:
+   - Job posting notifications/alerts (""new jobs matching your search"")
+   - Newsletter with job listings
+   - Marketing emails from job boards
+   - Weekly job digests
+   - ""Jobs you might be interested in""
+   - Promotional content
+
+If this is NOT a job application response, set isJobApplication=false and confidence=0.
+
+For VALID job applications:
+- Extract position from ""application for [POSITION]"" or ""applied to [POSITION]""
+- Extract company name from signature, footer, or metadata
+- If from recruitment platform (PNet, Indeed, LinkedIn, etc.) and no company specified, use platform name
+- For rejection emails (keywords: unfortunately, not proceeding, other candidates), set status to 'Rejected'
 
 Return ONLY valid JSON (no markdown, no explanation):
 
 {{
-  ""companyName"": ""string - company name or null"",
-  ""position"": ""string - job title/position or null"",
+  ""isJobApplication"": true/false,
+  ""companyName"": ""string or null"",
+  ""position"": ""string or null"",
   ""applicationStatus"": ""Applied|Interview Scheduled|Rejected|Offer|In Progress"",
   ""interviewDate"": ""ISO8601 string or null"",
   ""recruiterName"": ""string or null"",
@@ -469,14 +562,25 @@ JSON:";
         private string ExtractText(ClaudeApiResponse? response)
         {
             if (response?.Content == null || response.Content.Count == 0)
+            {
+                _logger.LogWarning("⚠️ Response or Content is null/empty");
                 return "{}";
+            }
+
+            _logger.LogInformation($"📊 Content blocks count: {response.Content.Count}");
 
             foreach (var block in response.Content)
             {
+                _logger.LogInformation($"📦 Block type: {block.Type}, Has text: {!string.IsNullOrEmpty(block.Text)}");
+
                 if (block.Type == "text" && !string.IsNullOrEmpty(block.Text))
+                {
+                    _logger.LogInformation($"✅ Extracted text length: {block.Text.Length}");
                     return block.Text;
+                }
             }
 
+            _logger.LogWarning("⚠️ No text content found in response blocks");
             return "{}";
         }
 
@@ -484,12 +588,12 @@ JSON:";
         {
             if (string.IsNullOrWhiteSpace(text)) return "{}";
 
-            // Remove markdown
+            // Remove markdown code blocks
             text = Regex.Replace(text, @"```(?:json)?\s*", "", RegexOptions.IgnoreCase);
             text = text.Trim();
 
-            // Extract JSON
-            var match = Regex.Match(text, @"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", RegexOptions.Singleline);
+            // Extract JSON object (handles nested objects)
+            var match = Regex.Match(text, @"\{(?:[^{}]|(?<open>\{)|(?<-open>\}))+(?(open)(?!))\}", RegexOptions.Singleline);
             return match.Success ? match.Value : "{}";
         }
 
@@ -527,24 +631,43 @@ JSON:";
     // Response classes
     public class ClaudeApiResponse
     {
+        [JsonPropertyName("id")]
         public string Id { get; set; } = string.Empty;
+
+        [JsonPropertyName("type")]
         public string Type { get; set; } = string.Empty;
+
+        [JsonPropertyName("role")]
         public string Role { get; set; } = string.Empty;
+
+        [JsonPropertyName("content")]
         public List<ContentBlock> Content { get; set; } = new();
+
+        [JsonPropertyName("model")]
         public string Model { get; set; } = string.Empty;
+
+        [JsonPropertyName("stop_reason")]
         public string StopReason { get; set; } = string.Empty;
+
+        [JsonPropertyName("usage")]
         public Usage Usage { get; set; } = new();
     }
 
     public class ContentBlock
     {
+        [JsonPropertyName("type")]
         public string Type { get; set; } = string.Empty;
+
+        [JsonPropertyName("text")]
         public string Text { get; set; } = string.Empty;
     }
 
     public class Usage
     {
+        [JsonPropertyName("input_tokens")]
         public int InputTokens { get; set; }
+
+        [JsonPropertyName("output_tokens")]
         public int OutputTokens { get; set; }
     }
 }

@@ -30,23 +30,23 @@ public class JobApplicationController : BaseController
     // GET: Get specific job application by ID
     [HttpGet("{id:length(24)}")]
     public async Task<ActionResult<JobApplication>> Get(string id)
+    {
+        var userId = GetUserId();
+        var jobApplication = await _jobApplicationService.GetAsync(id);
+
+        if (jobApplication == null)
         {
-            var userId = GetUserId();
-            var jobApplication = await _jobApplicationService.GetAsync(id);
-
-            if (jobApplication == null)
-            {
-                return NotFound();
-            }
-
-            // Verify the job application belongs to the user
-            if (jobApplication.userId != userId)
-            {
-                return Forbid();
-            }
-
-            return jobApplication;
+            return NotFound();
         }
+
+        // Verify the job application belongs to the user
+        if (jobApplication.userId != userId)
+        {
+            return Forbid();
+        }
+
+        return jobApplication;
+    }
 
     // POST: Create new job application
     [HttpPost]
@@ -87,7 +87,7 @@ public class JobApplicationController : BaseController
     public async Task<IActionResult> Update(string id, [FromBody] JobApplication updatedJobApplication)
     {
         var userId = GetUserId();
-        
+
         // Validate model state
         if (!ModelState.IsValid)
         {

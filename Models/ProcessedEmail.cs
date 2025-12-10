@@ -101,5 +101,8 @@ namespace JobTrackerApi.Models
 
         [BsonElement("extractionMethod")]
         public string ExtractionMethod { get; set; } = "unknown";
+
+        public bool IsJobApplication { get; set; } = true;
+        public string? Description { get; set; }
     }
 }
