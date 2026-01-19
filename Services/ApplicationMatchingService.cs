@@ -32,6 +32,13 @@ namespace JobTrackerApi.Services
             {
                 return null;
             }
+            
+            var companyName = extractedData.CompanyName.Trim();
+            if (companyName.Equals("Unknown Company", StringComparison.OrdinalIgnoreCase) ||
+                companyName.StartsWith("Recruitment Agency", StringComparison.OrdinalIgnoreCase))
+            {
+                return null;
+            }
 
             // Strategy 1: Exact match on company and position
             var exactMatch = await FindExactMatch(userId, extractedData);

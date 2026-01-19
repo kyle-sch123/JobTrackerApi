@@ -81,6 +81,14 @@ namespace JobTrackerApi.Services
 
         private ParsingStrategy DetermineParsingStrategy(EmailSignals signals)
         {
+            var missingCoreFields = string.IsNullOrEmpty(signals.CompanyName) || string.IsNullOrEmpty(signals.Position);
+            if (missingCoreFields)
+            {
+                return signals.OverallConfidence >= MEDIUM_CONFIDENCE_THRESHOLD
+                    ? ParsingStrategy.LLMRefinement
+                    : ParsingStrategy.LLMFull;
+            }
+
             if (signals.OverallConfidence >= HIGH_CONFIDENCE_THRESHOLD)
             {
                 return ParsingStrategy.RuleBasedOnly;
@@ -103,6 +111,12 @@ namespace JobTrackerApi.Services
             if (signals.PositionConfidence < 60) needsRefinement.Add("position");
             if (signals.CompanyConfidence < 60) needsRefinement.Add("company");
             if (signals.StatusConfidence < 60) needsRefinement.Add("status");
+
+            if (needsRefinement.Count == 0)
+            {
+                _logger.LogInformation("No fields need refinement; using rule-based result.");
+                return ConvertSignalsToExtractedData(signals);
+            }
 
             _logger.LogInformation($"🔍 LLM refining fields: {string.Join(", ", needsRefinement)}");
 

@@ -10,6 +10,7 @@ namespace JobTrackerApi.Services
         private readonly HybridEmailParser _hybridParser; // CHANGED: Use hybrid parser
         private readonly ApplicationMatchingService _matchingService;
         private readonly JobApplicationService _jobApplicationService;
+        private readonly JobRelatedEmailFilter _jobFilter;
         private readonly ILogger<EmailProcessingService> _logger;
 
         public EmailProcessingService(
@@ -17,11 +18,13 @@ namespace JobTrackerApi.Services
             HybridEmailParser hybridParser, // CHANGED: Inject hybrid parser
             ApplicationMatchingService matchingService,
             JobApplicationService jobApplicationService,
+            JobRelatedEmailFilter jobFilter,
             ILogger<EmailProcessingService> logger)
         {
             _hybridParser = hybridParser;
             _matchingService = matchingService;
             _jobApplicationService = jobApplicationService;
+            _jobFilter = jobFilter;
             _logger = logger;
 
             var settings = dbSettings.Value;
@@ -44,6 +47,34 @@ namespace JobTrackerApi.Services
             try
             {
                 _logger.LogInformation($"🔄 Processing email {email.GmailMessageId} (forced: {forceProcess})");
+
+                // Step 0: Pre-filter - Check if email is job-related to avoid unnecessary AI calls
+                var isJobRelated = forceProcess || _jobFilter.IsJobRelated(email);
+
+                if (!isJobRelated)
+                {
+                    _logger.LogInformation($"🚫 Email not job-related, skipping AI processing: {email.Subject}");
+
+                    // Mark as not job-related and skip processing
+                    var skipUpdate = Builders<ProcessedEmail>.Update
+                        .Set(e => e.IsJobRelated, false)
+                        .Set(e => e.ProcessingStatus, "skipped_not_job_related")
+                        .Set(e => e.ProcessedAt, DateTime.UtcNow);
+
+                    await _processedEmailCollection.UpdateOneAsync(e => e.Id == email.Id, skipUpdate);
+
+                    result.Success = true;
+                    result.Action = "skipped_not_job_related";
+                    result.Message = "Email determined not job-related, skipped AI processing";
+
+                    return result;
+                }
+
+                // Mark as job-related
+                var jobRelatedUpdate = Builders<ProcessedEmail>.Update
+                    .Set(e => e.IsJobRelated, true);
+
+                await _processedEmailCollection.UpdateOneAsync(e => e.Id == email.Id, jobRelatedUpdate);
 
                 // Step 1: Parse email with HYBRID parser (rule-based → LLM)
                 var extractedData = await _hybridParser.ParseEmailAsync(email);
@@ -108,19 +139,20 @@ namespace JobTrackerApi.Services
         }
 
         private async Task AutoProcessApplication(
-            ProcessedEmail email,
-            EmailExtractedData extractedData,
-            ProcessingResult result)
+    ProcessedEmail email,
+    EmailExtractedData extractedData,
+    ProcessingResult result)
         {
+            // Step 1: Check if matching application exists
             var existingApp = await _matchingService.FindMatchingApplicationAsync(
                 email.UserId,
                 extractedData
             );
 
-            var shouldCreateNew = _matchingService.ShouldCreateNew(existingApp, extractedData, email);
-
-            if (shouldCreateNew)
+            // FIXED: Simplified logic - if no existing app, always create new
+            if (existingApp == null)
             {
+                // No matching application found - create new one
                 var newApp = CreateJobApplicationFromEmail(email, extractedData);
                 await _jobApplicationService.CreateAsync(newApp);
 
@@ -133,22 +165,55 @@ namespace JobTrackerApi.Services
                 result.JobApplicationId = newApp.Id;
                 result.Message = $"Created new application for {extractedData.CompanyName} - {extractedData.Position}";
 
-                _logger.LogInformation($"✅ Created job application {newApp.Id} from email {email.GmailMessageId}");
+                _logger.LogInformation(
+                    $"✅ Created job application {newApp.Id} from email {email.GmailMessageId} " +
+                    $"(Company: {extractedData.CompanyName}, Position: {extractedData.Position})"
+                );
             }
-            else if (existingApp != null)
+            else
             {
-                await UpdateJobApplicationFromEmail(existingApp, email, extractedData);
+                // Existing application found - decide whether to update or create new
+                var shouldCreateNew = _matchingService.ShouldCreateNew(existingApp, extractedData, email);
 
-                var emailUpdate = Builders<ProcessedEmail>.Update
-                    .Set(e => e.JobApplicationId, existingApp.Id)
-                    .Set(e => e.ProcessingStatus, "processed");
+                if (shouldCreateNew)
+                {
+                    // Create new application (e.g., same company but different position)
+                    var newApp = CreateJobApplicationFromEmail(email, extractedData);
+                    await _jobApplicationService.CreateAsync(newApp);
 
-                await _processedEmailCollection.UpdateOneAsync(e => e.Id == email.Id, emailUpdate);
+                    var emailUpdate = Builders<ProcessedEmail>.Update
+                        .Set(e => e.JobApplicationId, newApp.Id)
+                        .Set(e => e.ProcessingStatus, "processed");
 
-                result.JobApplicationId = existingApp.Id;
-                result.Message = $"Updated application for {extractedData.CompanyName}";
+                    await _processedEmailCollection.UpdateOneAsync(e => e.Id == email.Id, emailUpdate);
 
-                _logger.LogInformation($"🔄 Updated job application {existingApp.Id} from email {email.GmailMessageId}");
+                    result.JobApplicationId = newApp.Id;
+                    result.Message = $"Created separate application for {extractedData.CompanyName} - {extractedData.Position} " +
+                                   $"(different from existing application)";
+
+                    _logger.LogInformation(
+                        $"✅ Created new job application {newApp.Id} (separate from existing {existingApp.Id}) " +
+                        $"from email {email.GmailMessageId}"
+                    );
+                }
+                else
+                {
+                    // Update existing application
+                    await UpdateJobApplicationFromEmail(existingApp, email, extractedData);
+
+                    var emailUpdate = Builders<ProcessedEmail>.Update
+                        .Set(e => e.JobApplicationId, existingApp.Id)
+                        .Set(e => e.ProcessingStatus, "processed");
+
+                    await _processedEmailCollection.UpdateOneAsync(e => e.Id == email.Id, emailUpdate);
+
+                    result.JobApplicationId = existingApp.Id;
+                    result.Message = $"Updated existing application for {extractedData.CompanyName}";
+
+                    _logger.LogInformation(
+                        $"🔄 Updated existing job application {existingApp.Id} from email {email.GmailMessageId}"
+                    );
+                }
             }
         }
 

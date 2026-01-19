@@ -39,6 +39,11 @@ var firebaseProjectId = Environment.GetEnvironmentVariable("FIREBASE_PROJECT_ID"
 var firebasePrivateKey = Environment.GetEnvironmentVariable("FIREBASE_PRIVATE_KEY");
 var firebaseClientEmail = Environment.GetEnvironmentVariable("FIREBASE_CLIENT_EMAIL");
 
+var firebaseConfigured = !string.IsNullOrEmpty(firebaseProjectId) &&
+    !string.IsNullOrEmpty(firebasePrivateKey) &&
+    !string.IsNullOrEmpty(firebaseClientEmail);
+var firebaseInitialized = false;
+
 // Add them to configuration so they can be used like appsettings.json values
 builder.Configuration["JobApplicationDatabase:ConnectionString"] = connectionString;
 builder.Configuration["JobApplicationDatabase:DatabaseName"] = databaseName;
@@ -48,9 +53,7 @@ builder.Configuration["JobApplicationDatabase:EmailSyncHistoryCollectionName"] =
 builder.Configuration["JobApplicationDatabase:ProcessedEmailCollectionName"] = processedEmailCollectionName;
 
 // Initialize Firebase Admin SDK safely
-if (!string.IsNullOrEmpty(firebaseProjectId) &&
-    !string.IsNullOrEmpty(firebasePrivateKey) &&
-    !string.IsNullOrEmpty(firebaseClientEmail))
+if (firebaseConfigured)
 {
     var cleanedPrivateKey = firebasePrivateKey
         .Replace("\\n", "\n")
@@ -75,12 +78,8 @@ if (!string.IsNullOrEmpty(firebaseProjectId) &&
             Credential = credential
         });
 
-        Console.WriteLine("🔥 Firebase Admin initialized using CredentialFactory.");
     }
-}
-else
-{
-    Console.WriteLine("❌ Firebase Admin NOT initialized — missing environment vars");
+    firebaseInitialized = FirebaseApp.DefaultInstance != null;
 }
 
 
@@ -103,6 +102,7 @@ builder.Services.AddSingleton<ApplicationMatchingService>();
 builder.Services.AddSingleton<EmailProcessingService>();
 builder.Services.AddSingleton<RuleBasedEmailParser>();
 builder.Services.AddSingleton<HybridEmailParser>();
+builder.Services.AddSingleton<JobRelatedEmailFilter>();
 
 builder.Services.AddScoped<BackgroundEmailSyncJob>();
 
@@ -150,6 +150,15 @@ builder.Services.AddCors(options =>
 });
 
 var app = builder.Build();
+
+if (!firebaseConfigured)
+{
+    app.Logger.LogWarning("Firebase Admin not initialized (missing environment variables).");
+}
+else if (firebaseInitialized)
+{
+    app.Logger.LogInformation("Firebase Admin initialized.");
+}
 
 // Configure the HTTP request pipeline.
 if (app.Environment.IsDevelopment())

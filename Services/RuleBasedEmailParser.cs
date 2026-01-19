@@ -37,6 +37,16 @@ namespace JobTrackerApi.Services
             // Add more as needed
         };
 
+        private static readonly string[] GenericEmailDomains = new[]
+        {
+            "gmail.com",
+            "yahoo.com",
+            "outlook.com",
+            "hotmail.com",
+            "live.com",
+            "icloud.com"
+        };
+
         public RuleBasedEmailParser(ILogger<RuleBasedEmailParser> logger)
         {
             _logger = logger;
@@ -45,7 +55,6 @@ namespace JobTrackerApi.Services
         public EmailSignals ParseEmail(ProcessedEmail email)
         {
             var signals = new EmailSignals();
-            var content = $"{email.Subject}\n{email.BodyPlainText ?? email.BodyHtml ?? email.Snippet}";
 
             _logger.LogInformation($"🔍 Rule-based parsing: {email.Subject}");
 
@@ -75,6 +84,8 @@ namespace JobTrackerApi.Services
 
         private void DetectPosition(ProcessedEmail email, EmailSignals signals)
         {
+            var bodyText = GetBodyText(email);
+            var contentText = $"{email.Subject}\n{bodyText}";
             var patterns = new[]
             {
                 // High confidence patterns (95%)
@@ -96,8 +107,8 @@ namespace JobTrackerApi.Services
             foreach (var patternInfo in patterns)
             {
                 var searchText = patternInfo.Source == "subject" ? email.Subject :
-                                patternInfo.Source == "body" ? (email.BodyPlainText ?? "") :
-                                $"{email.Subject}\n{email.BodyPlainText ?? email.BodyHtml ?? email.Snippet}";
+                                patternInfo.Source == "body" ? bodyText :
+                                contentText;
 
                 var match = Regex.Match(searchText, patternInfo.Pattern, RegexOptions.IgnoreCase);
                 if (match.Success && match.Groups[1].Success)
@@ -153,6 +164,8 @@ namespace JobTrackerApi.Services
 
         private void DetectCompany(ProcessedEmail email, EmailSignals signals)
         {
+            var bodyText = GetBodyText(email);
+
             // Strategy 1: Known company domain (95% confidence)
             var domain = email.FromEmail.Split('@').LastOrDefault()?.ToLower() ?? "";
             foreach (var (knownDomain, companyName) in KnownCompanyDomains)
@@ -178,7 +191,24 @@ namespace JobTrackerApi.Services
             var isJobBoard = JobBoardDomains.Any(jb => domain.Contains(jb.Key));
             if (isJobBoard)
             {
-                var bodyCompany = ExtractCompanyFromBody(email);
+                var subjectCompany = ExtractCompanyFromSubject(email.Subject);
+                if (!string.IsNullOrEmpty(subjectCompany))
+                {
+                    signals.CompanyName = subjectCompany;
+                    signals.CompanyConfidence = 70;
+                    signals.Signals.Add(new DetectedSignal
+                    {
+                        SignalType = "subject_extraction",
+                        Field = "company",
+                        Value = subjectCompany,
+                        Confidence = 70,
+                        Source = "subject"
+                    });
+                    _logger.LogDebug($"Company from subject: '{subjectCompany}' (70%)");
+                    return;
+                }
+
+                var bodyCompany = ExtractCompanyFromBody(bodyText);
                 if (!string.IsNullOrEmpty(bodyCompany))
                 {
                     signals.CompanyName = bodyCompany;
@@ -194,6 +224,12 @@ namespace JobTrackerApi.Services
                     _logger.LogDebug($"  ✓ Company from body: '{bodyCompany}' (70%)");
                     return;
                 }
+            }
+
+            if (isJobBoard && string.IsNullOrEmpty(signals.CompanyName))
+            {
+                signals.CompanyConfidence = 0;
+                return;
             }
 
             // Strategy 3: From "From" name (60% confidence)
@@ -212,6 +248,13 @@ namespace JobTrackerApi.Services
                     Source = "email_headers"
                 });
                 _logger.LogDebug($"  ✓ Company from sender name: '{fromName}' (60%)");
+                return;
+            }
+
+            if (GenericEmailDomains.Any(d => domain.EndsWith(d)))
+            {
+                signals.CompanyName = null;
+                signals.CompanyConfidence = 0;
                 return;
             }
 
@@ -238,9 +281,8 @@ namespace JobTrackerApi.Services
             signals.CompanyConfidence = 0;
         }
 
-        private string? ExtractCompanyFromBody(ProcessedEmail email)
+        private string? ExtractCompanyFromBody(string body)
         {
-            var body = email.BodyPlainText ?? email.BodyHtml ?? "";
             var patterns = new[]
             {
                 @"on behalf of\s+([A-Z][A-Za-z\s&]{2,40})",
@@ -265,6 +307,35 @@ namespace JobTrackerApi.Services
             return null;
         }
 
+        private string? ExtractCompanyFromSubject(string subject)
+        {
+            if (string.IsNullOrWhiteSpace(subject)) return null;
+
+            var patterns = new[]
+            {
+                @"application\s+(?:to|with|at)\s+([A-Z][A-Za-z0-9\s&'\-]{2,60})",
+                @"interview\s+(?:with|at)\s+([A-Z][A-Za-z0-9\s&'\-]{2,60})",
+                @"offer\s+from\s+([A-Z][A-Za-z0-9\s&'\-]{2,60})",
+                @"rejection\s+from\s+([A-Z][A-Za-z0-9\s&'\-]{2,60})",
+                @"your\s+application\s+to\s+([A-Z][A-Za-z0-9\s&'\-]{2,60})"
+            };
+
+            foreach (var pattern in patterns)
+            {
+                var match = Regex.Match(subject, pattern, RegexOptions.IgnoreCase);
+                if (match.Success && match.Groups[1].Success)
+                {
+                    var company = match.Groups[1].Value.Trim();
+                    if (company.Length >= 2 && company.Length <= 60)
+                    {
+                        return CleanCompanyName(company);
+                    }
+                }
+            }
+
+            return null;
+        }
+
         private string CleanCompanyName(string company)
         {
             company = Regex.Replace(company, @"\s+(Inc\.?|LLC|Ltd\.?|Corp\.?|Corporation|Limited)$", "", RegexOptions.IgnoreCase);
@@ -277,7 +348,7 @@ namespace JobTrackerApi.Services
 
         private void DetectStatus(ProcessedEmail email, EmailSignals signals)
         {
-            var content = $"{email.Subject}\n{email.BodyPlainText ?? email.BodyHtml ?? email.Snippet}".ToLower();
+            var content = $"{email.Subject}\n{GetBodyText(email)}".ToLower();
 
             var statusPatterns = new[]
             {
@@ -313,8 +384,8 @@ namespace JobTrackerApi.Services
                 }
             }
 
-            signals.ApplicationStatus = "Applied"; // Default
-            signals.StatusConfidence = 50;
+            signals.ApplicationStatus = null;
+            signals.StatusConfidence = 0;
         }
 
         #endregion
@@ -323,7 +394,7 @@ namespace JobTrackerApi.Services
 
         private void DetectInterviewDate(ProcessedEmail email, EmailSignals signals)
         {
-            var content = email.BodyPlainText ?? email.BodyHtml ?? email.Snippet ?? "";
+            var content = GetBodyText(email);
 
             // Pattern: "on January 15th at 2pm", "January 15, 2025 at 14:00"
             var datePatterns = new[]
@@ -402,7 +473,7 @@ namespace JobTrackerApi.Services
             }
 
             // Extract from signature
-            var body = email.BodyPlainText ?? email.BodyHtml ?? "";
+            var body = GetBodyText(email);
             var signatureMatch = Regex.Match(body, @"(?:Regards?|Thanks?|Best),?\s*\n\s*([A-Z][a-z]+\s+[A-Z][a-z]+)", RegexOptions.IgnoreCase);
             if (signatureMatch.Success)
             {
@@ -433,7 +504,14 @@ namespace JobTrackerApi.Services
 
         private void DetectJobUrl(ProcessedEmail email, EmailSignals signals)
         {
-            var content = email.BodyPlainText ?? email.BodyHtml ?? "";
+            var content = !string.IsNullOrWhiteSpace(email.BodyPlainText)
+                ? email.BodyPlainText
+                : (email.BodyHtml ?? "");
+
+            if (string.IsNullOrWhiteSpace(content))
+            {
+                content = email.Snippet ?? "";
+            }
 
             // Extract URLs
             var urlPattern = @"https?://[^\s<>""']+";
@@ -468,12 +546,16 @@ namespace JobTrackerApi.Services
 
         private void DetectSalary(ProcessedEmail email, EmailSignals signals)
         {
-            var content = email.BodyPlainText ?? email.BodyHtml ?? "";
+            var content = GetBodyText(email);
 
             var salaryPatterns = new[]
             {
                 @"\$\d{2,3}[,\d]*(?:\s*-\s*\$\d{2,3}[,\d]*)?(?:\s*(?:per|/)\s*(?:year|annum|month))?",
                 @"R\d{3}[,\d]*(?:\s*-\s*R\d{3}[,\d]*)?(?:\s*(?:per|/)\s*(?:year|annum|month))?",
+                @"A\$\d{2,3}[,\d]*(?:\s*-\s*A\$\d{2,3}[,\d]*)?(?:\s*(?:per|/)\s*(?:year|annum))?",
+                @"(?:USD|EUR|GBP)\s*\d{2,3}[,\d]*(?:\s*-\s*(?:USD|EUR|GBP)\s*\d{2,3}[,\d]*)?(?:\s*(?:per|/)\s*(?:year|annum))?",
+                @"A\$\d{2,3}[,\d]*(?:\s*-\s*A\$\d{2,3}[,\d]*)?(?:\s*(?:per|/)\s*(?:year|annum))?",
+                @"(?:USD|EUR|GBP)\s*\d{2,3}[,\d]*(?:\s*-\s*(?:USD|EUR|GBP)\s*\d{2,3}[,\d]*)?(?:\s*(?:per|/)\s*(?:year|annum))?",
                 @"£\d{2,3}[,\d]*(?:\s*-\s*£\d{2,3}[,\d]*)?(?:\s*(?:per|/)\s*(?:year|annum))?",
                 @"€\d{2,3}[,\d]*(?:\s*-\s*€\d{2,3}[,\d]*)?(?:\s*(?:per|/)\s*(?:year|annum))?"
             };
@@ -548,7 +630,46 @@ namespace JobTrackerApi.Services
                 totalWeight += weights["interviewDate"];
             }
 
-            signals.OverallConfidence = totalWeight > 0 ? weightedSum / totalWeight : 0;
+            var overallConfidence = totalWeight > 0 ? weightedSum / totalWeight : 0;
+
+            // Penalize missing core fields to avoid false positives
+            if (string.IsNullOrEmpty(signals.CompanyName))
+            {
+                overallConfidence = Math.Max(0, overallConfidence - 20);
+            }
+
+            if (string.IsNullOrEmpty(signals.Position))
+            {
+                overallConfidence = Math.Max(0, overallConfidence - 20);
+            }
+
+            signals.OverallConfidence = overallConfidence;
+        }
+
+        private string GetBodyText(ProcessedEmail email)
+        {
+            if (!string.IsNullOrWhiteSpace(email.BodyPlainText))
+            {
+                return email.BodyPlainText;
+            }
+
+            if (!string.IsNullOrWhiteSpace(email.BodyHtml))
+            {
+                return StripHtml(email.BodyHtml);
+            }
+
+            return email.Snippet ?? "";
+        }
+
+        private string StripHtml(string html)
+        {
+            if (string.IsNullOrEmpty(html)) return "";
+
+            html = Regex.Replace(html, "<style[^>]*>.*?</style>", "", RegexOptions.Singleline | RegexOptions.IgnoreCase);
+            html = Regex.Replace(html, "<script[^>]*>.*?</script>", "", RegexOptions.Singleline | RegexOptions.IgnoreCase);
+            html = Regex.Replace(html, "<[^>]+>", " ");
+            html = Regex.Replace(html, @"\s+", " ");
+            return html.Trim();
         }
 
         #endregion

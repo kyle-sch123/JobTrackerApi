@@ -194,26 +194,45 @@ CRITICAL RULES:
             }
             data.Confidence = Math.Clamp(data.Confidence, 0, 100);
 
-            // 2. Handle company name
-            if (string.IsNullOrWhiteSpace(data.CompanyName) ||
-                data.CompanyName.Equals("Unknown", StringComparison.OrdinalIgnoreCase) ||
-                data.CompanyName.Equals("Unknown Company", StringComparison.OrdinalIgnoreCase))
-            {
-                var extractedCompany = ExtractCompanyFromEmail(email);
+            // 2. Handle company name - FIXED LOGIC
+            bool needsCompanyFallback = string.IsNullOrWhiteSpace(data.CompanyName) ||
+                                        data.CompanyName.Equals("Unknown", StringComparison.OrdinalIgnoreCase) ||
+                                        data.CompanyName.Equals("Unknown Company", StringComparison.OrdinalIgnoreCase);
 
-                // Check if it's from a recruitment platform
-                if (IsRecruitmentPlatform(email.FromEmail) || extractedCompany == "Unknown Company")
+            if (needsCompanyFallback)
+            {
+                // Check if it's from a recruitment platform first
+                if (IsRecruitmentPlatform(email.FromEmail))
                 {
                     data.CompanyName = DetermineRecruitmentSource(email);
                     _logger.LogInformation($"🔍 Recruitment platform detected: '{data.CompanyName}'");
                 }
                 else
                 {
-                    data.CompanyName = extractedCompany;
+                    // Try extracting from email
+                    var extractedCompany = ExtractCompanyFromEmail(email);
+
+                    // If extraction still fails, default to recruitment agency
+                    if (string.IsNullOrWhiteSpace(extractedCompany) ||
+                        extractedCompany.Equals("Unknown Company", StringComparison.OrdinalIgnoreCase))
+                    {
+                        data.CompanyName = DetermineRecruitmentSource(email);
+                        _logger.LogInformation($"🔍 Defaulting to recruitment source: '{data.CompanyName}'");
+                    }
+                    else
+                    {
+                        data.CompanyName = extractedCompany;
+                    }
                 }
 
                 data.Confidence = Math.Max(0, data.Confidence - 15);
                 _logger.LogInformation($"🔍 Fallback company extraction: '{data.CompanyName}'");
+            }
+            // ADDED: Even if company name exists, verify it's not "Unknown Company"
+            else if (data.CompanyName.Equals("Unknown Company", StringComparison.OrdinalIgnoreCase))
+            {
+                data.CompanyName = DetermineRecruitmentSource(email);
+                _logger.LogInformation($"🔍 Replaced 'Unknown Company' with: '{data.CompanyName}'");
             }
 
             // 3. Fix position if missing
@@ -235,6 +254,9 @@ CRITICAL RULES:
 
             // 5. Clean up company name
             data.CompanyName = CleanCompanyName(data.CompanyName);
+
+            // 6. ALWAYS set description for AI-generated entries
+            data.Description = "Automatically generated from your email via AI";
         }
 
         private bool IsRecruitmentPlatform(string email)
@@ -255,23 +277,29 @@ CRITICAL RULES:
             var emailLower = email.FromEmail.ToLower();
 
             if (emailLower.Contains("pnet.co.za"))
-                return "PNet Job Application";
+                return "Recruitment Agency (via PNet)";
             if (emailLower.Contains("indeed.com"))
-                return "Indeed Job Application";
+                return "Recruitment Agency (via Indeed)";
             if (emailLower.Contains("linkedin.com"))
-                return "LinkedIn Job Application";
+                return "Recruitment Agency (via LinkedIn)";
+            if (emailLower.Contains("glassdoor"))
+                return "Recruitment Agency (via Glassdoor)";
             if (emailLower.Contains("bamboohr.com") || emailLower.Contains("workday") ||
                 emailLower.Contains("greenhouse") || emailLower.Contains("lever"))
-                return "Recruitment Agency (ATS)";
-            if (emailLower.Contains("glassdoor"))
-                return "Glassdoor Job Application";
+                return "Recruitment Agency (via ATS Platform)";
+            if (emailLower.Contains("smartrecruiters.com"))
+                return "Recruitment Agency (via SmartRecruiters)";
+            if (emailLower.Contains("jobvite.com"))
+                return "Recruitment Agency (via Jobvite)";
 
             // Try to extract agency/company name from subject or body
             var agencyName = ExtractAgencyFromContent(email);
             if (!string.IsNullOrEmpty(agencyName))
-                return agencyName;
+                return $"Recruitment Agency (via {agencyName})";
 
-            return "Recruitment Agency";
+            // Default fallback - extract domain name as last resort
+            var domain = email.FromEmail.Split('@').LastOrDefault()?.Split('.').FirstOrDefault() ?? "Unknown";
+            return $"Recruitment Agency (via {char.ToUpper(domain[0]) + domain.Substring(1)})";
         }
 
         private string ExtractAgencyFromContent(ProcessedEmail email)
@@ -465,12 +493,30 @@ CRITICAL RULES:
 
         private EmailExtractedData CreateFallbackExtraction(ProcessedEmail email)
         {
-            var companyName = ExtractCompanyFromEmail(email);
+            var companyName = "Unknown Company";
 
-            // Check if it's from a recruitment platform
-            if (IsRecruitmentPlatform(email.FromEmail) || companyName == "Unknown Company")
+            // Check if it's from a recruitment platform FIRST
+            if (IsRecruitmentPlatform(email.FromEmail))
             {
                 companyName = DetermineRecruitmentSource(email);
+                _logger.LogInformation($"🔍 Fallback: Recruitment platform detected - '{companyName}'");
+            }
+            else
+            {
+                // Try to extract company
+                var extracted = ExtractCompanyFromEmail(email);
+
+                if (string.IsNullOrWhiteSpace(extracted) ||
+                    extracted.Equals("Unknown Company", StringComparison.OrdinalIgnoreCase))
+                {
+                    // Still couldn't find it, use recruitment source as ultimate fallback
+                    companyName = DetermineRecruitmentSource(email);
+                    _logger.LogInformation($"🔍 Fallback: Using recruitment source - '{companyName}'");
+                }
+                else
+                {
+                    companyName = extracted;
+                }
             }
 
             var position = ExtractPositionFromEmail(email);
@@ -489,7 +535,7 @@ CRITICAL RULES:
                 Confidence = 30,
                 RecruiterEmail = email.FromEmail,
                 IsJobApplication = true,
-                Description = "Automatically created from your email via AI"
+                Description = "Automatically generated from your email via AI"
             };
         }
 

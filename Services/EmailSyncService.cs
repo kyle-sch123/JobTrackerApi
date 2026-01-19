@@ -12,6 +12,7 @@ namespace JobTrackerApi.Services
         private readonly GmailEmailService _emailService;
         private readonly ClaudeEmailParserService _parserService;
         private readonly JobApplicationService _jobService;
+        private readonly JobRelatedEmailFilter _jobFilter;
         private readonly ILogger<EmailSyncService> _logger;
 
         public EmailSyncService(
@@ -20,18 +21,20 @@ namespace JobTrackerApi.Services
             GmailEmailService emailService,
             ClaudeEmailParserService parserService,
             JobApplicationService jobService,
+            JobRelatedEmailFilter jobFilter,
             ILogger<EmailSyncService> logger)
         {
             _authService = authService;
             _emailService = emailService;
             _parserService = parserService;
             _jobService = jobService;
+            _jobFilter = jobFilter;
             _logger = logger;
 
             var settings = dbSettings.Value;
             var mongoClient = new MongoClient(settings.ConnectionString);
             var mongoDatabase = mongoClient.GetDatabase(settings.DatabaseName);
-            
+
             _syncHistoryCollection = mongoDatabase.GetCollection<EmailSyncHistory>(
                 settings.EmailSyncHistoryCollectionName
             );
@@ -74,13 +77,22 @@ namespace JobTrackerApi.Services
                 {
                     try
                     {
-                        var extracted = await _parserService.ParseEmailAsync(email);
-                        email.ExtractedData = extracted;
-                        email.AiParsed = true;
+                        // Step 1: Pre-filter - Check if email is job-related to avoid unnecessary AI calls
+                        var isJobRelated = _jobFilter.IsJobRelated(email);
 
-                        // Mark as job related if parser found company or position or has non-zero confidence
-                        if (!string.IsNullOrEmpty(extracted.CompanyName) || !string.IsNullOrEmpty(extracted.Position) || extracted.Confidence > 0.2)
+                        if (!isJobRelated)
                         {
+                            _logger.LogInformation($"🚫 Email not job-related, skipping AI processing: {email.Subject}");
+                            email.IsJobRelated = false;
+                            email.ProcessingStatus = "skipped_not_job_related";
+                            email.AiParsed = false;
+                        }
+                        else
+                        {
+                            // Step 2: Parse job-related email with AI
+                            var extracted = await _parserService.ParseEmailAsync(email);
+                            email.ExtractedData = extracted;
+                            email.AiParsed = true;
                             email.IsJobRelated = true;
 
                             // Try to match existing job by job URL or company+position
@@ -121,10 +133,10 @@ namespace JobTrackerApi.Services
                                 await _jobService.CreateAsync(newJob);
                                 email.JobApplicationId = newJob.Id;
                             }
-                        }
 
-                        email.ProcessingStatus = "processed";
-                        processedCount++;
+                            email.ProcessingStatus = "processed";
+                            processedCount++;
+                        }
                     }
                     catch (Exception ex)
                     {
@@ -156,7 +168,7 @@ namespace JobTrackerApi.Services
             catch (Exception ex)
             {
                 _logger.LogError(ex, $"Failed to sync emails for user {userId}");
-                
+
                 syncHistory.Status = "failed";
                 syncHistory.SyncCompletedAt = DateTime.UtcNow;
                 syncHistory.Errors.Add(ex.Message);
@@ -184,7 +196,7 @@ namespace JobTrackerApi.Services
         public async Task<List<EmailSyncHistory>> SyncAllUsersAsync()
         {
             var results = new List<EmailSyncHistory>();
-            
+
             try
             {
                 var activeConnections = await _authService.GetAllActiveConnectionsAsync();
