@@ -6,7 +6,7 @@ namespace JobTrackerApi.Controllers;
 
 [ApiController]
 [Route("api/[controller]")]
-public class JobApplicationController : ControllerBase
+public class JobApplicationController : BaseController
 {
     private readonly JobApplicationService _jobApplicationService;
 
@@ -16,8 +16,9 @@ public class JobApplicationController : ControllerBase
     // GET: Get all job applications OR filter by userId query parameter
     [HttpGet]
     [Route("/api/jobapplications")]
-    public async Task<ActionResult<List<JobApplication>>> GetAll([FromQuery] string? userId = null)
+    public async Task<ActionResult<List<JobApplication>>> GetAll()
     {
+        var userId = GetUserId();
         // If userId is provided, filter by user, otherwise return all
         var jobApplications = string.IsNullOrEmpty(userId)
             ? await _jobApplicationService.GetAsync()
@@ -26,26 +27,25 @@ public class JobApplicationController : ControllerBase
         return Ok(jobApplications);
     }
 
-    // GET: Get all job applications for a specific user (alternative route)
-    [HttpGet("user/{userId}")]
-    public async Task<ActionResult<List<JobApplication>>> GetByUser(string userId)
-    {
-        var jobApplications = await _jobApplicationService.GetByUserAsync(userId);
-        return Ok(jobApplications);
-    }
-
     // GET: Get specific job application by ID
     [HttpGet("{id:length(24)}")]
     public async Task<ActionResult<JobApplication>> Get(string id)
     {
+        var userId = GetUserId();
         var jobApplication = await _jobApplicationService.GetAsync(id);
 
-        if (jobApplication is null)
+        if (jobApplication == null)
         {
-            return NotFound(new { message = "Job application not found" });
+            return NotFound();
         }
 
-        return Ok(jobApplication);
+        // Verify the job application belongs to the user
+        if (jobApplication.userId != userId)
+        {
+            return Forbid();
+        }
+
+        return jobApplication;
     }
 
     // POST: Create new job application
@@ -53,6 +53,10 @@ public class JobApplicationController : ControllerBase
     [Route("/api/jobapplications")] // Match the singular route your frontend expects
     public async Task<IActionResult> Post([FromBody] JobApplication jobApplication)
     {
+        var userId = GetUserId();
+
+        // Ensure the userId matches the authenticated user
+        jobApplication.userId = userId;
 
         // Validate model state
         if (!ModelState.IsValid)
@@ -82,6 +86,8 @@ public class JobApplicationController : ControllerBase
     // [Route("/api/jobapplication/{id:length(24)}")] // Match singular route
     public async Task<IActionResult> Update(string id, [FromBody] JobApplication updatedJobApplication)
     {
+        var userId = GetUserId();
+
         // Validate model state
         if (!ModelState.IsValid)
         {
