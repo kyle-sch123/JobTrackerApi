@@ -58,6 +58,17 @@ namespace JobTrackerApi.Services
 
             _logger.LogInformation($"🔍 Rule-based parsing: {email.Subject}");
 
+            // Step 0: Check if this is a newsletter/job alert (not an actual application)
+            DetectNonApplicationEmail(email, signals);
+
+            // If it's not a job application, skip extraction and return early with low confidence
+            if (!signals.IsJobApplication)
+            {
+                _logger.LogInformation($"🚫 Detected as non-application email (newsletter/alert/posting)");
+                signals.OverallConfidence = 0;
+                return signals;
+            }
+
             // Run all detectors
             DetectPosition(email, signals);
             DetectCompany(email, signals);
@@ -79,6 +90,177 @@ namespace JobTrackerApi.Services
 
             return signals;
         }
+
+        #region Non-Application Detection
+
+        /// <summary>
+        /// Detects if an email is NOT an actual job application response
+        /// (e.g., newsletters, job alerts, job postings, marketing emails)
+        /// </summary>
+        private void DetectNonApplicationEmail(ProcessedEmail email, EmailSignals signals)
+        {
+            var subject = email.Subject?.ToLower() ?? "";
+            var body = GetBodyText(email).ToLower();
+            var content = $"{subject} {body}";
+            var fromEmail = email.FromEmail?.ToLower() ?? "";
+
+            // Newsletter/alert indicators in subject
+            var newsletterSubjectPatterns = new[]
+            {
+                @"new jobs? (?:matching|for you|alert|posted)",
+                @"jobs? you might (?:like|be interested)",
+                @"\d+ new jobs?",
+                @"weekly job (?:digest|alert|update)",
+                @"daily job (?:digest|alert|update)",
+                @"job recommendations?",
+                @"jobs? in your area",
+                @"jobs? based on your",
+                @"job alert:",
+                @"new opportunities",
+                @"trending jobs?",
+                @"top jobs? for",
+                @"jobs? matching your (?:profile|search|preferences)",
+                @"your job alert",
+                @"career opportunities",
+                @"is hiring",
+                @"are hiring",
+                @"now hiring"
+            };
+
+            foreach (var pattern in newsletterSubjectPatterns)
+            {
+                if (Regex.IsMatch(subject, pattern, RegexOptions.IgnoreCase))
+                {
+                    signals.IsJobApplication = false;
+                    signals.Signals.Add(new DetectedSignal
+                    {
+                        SignalType = "newsletter_subject",
+                        Field = "isJobApplication",
+                        Value = "false",
+                        Confidence = 95,
+                        Source = "subject",
+                        Pattern = pattern
+                    });
+                    _logger.LogDebug($"  ✗ Newsletter detected via subject pattern: {pattern}");
+                    return;
+                }
+            }
+
+            // Newsletter/alert indicators in body
+            var newsletterBodyPatterns = new[]
+            {
+                @"(?:here are|check out|see) (?:the |some )?(?:new )?jobs?",
+                @"jobs? that match your",
+                @"based on your (?:profile|search|job alert)",
+                @"unsubscribe from (?:these )?(?:job )?alerts?",
+                @"manage your job alerts?",
+                @"update your job preferences",
+                @"you're receiving this (?:email )?because you (?:signed up|subscribed)",
+                @"view (?:all |more )?jobs?",
+                @"see all \d+ jobs?",
+                @"browse (?:more |all )?jobs?"
+            };
+
+            foreach (var pattern in newsletterBodyPatterns)
+            {
+                if (Regex.IsMatch(body, pattern, RegexOptions.IgnoreCase))
+                {
+                    signals.IsJobApplication = false;
+                    signals.Signals.Add(new DetectedSignal
+                    {
+                        SignalType = "newsletter_body",
+                        Field = "isJobApplication",
+                        Value = "false",
+                        Confidence = 90,
+                        Source = "body",
+                        Pattern = pattern
+                    });
+                    _logger.LogDebug($"  ✗ Newsletter detected via body pattern: {pattern}");
+                    return;
+                }
+            }
+
+            // Known newsletter/alert sender patterns
+            var newsletterSenderPatterns = new[]
+            {
+                @"jobalert",
+                @"job-alert",
+                @"jobs@",
+                @"careers@",
+                @"notifications@",
+                @"alerts@",
+                @"newsletter@",
+                @"noreply.*linkedin",
+                @"messages-noreply@linkedin",
+                @"jobmail"
+            };
+
+            foreach (var pattern in newsletterSenderPatterns)
+            {
+                if (Regex.IsMatch(fromEmail, pattern, RegexOptions.IgnoreCase))
+                {
+                    // Additional check: if it's from a noreply AND has newsletter content, flag it
+                    var hasNewsletterContent = content.Contains("new job") ||
+                                               content.Contains("jobs for you") ||
+                                               content.Contains("job alert") ||
+                                               content.Contains("matching your") ||
+                                               content.Contains("recommended job");
+
+                    if (hasNewsletterContent)
+                    {
+                        signals.IsJobApplication = false;
+                        signals.Signals.Add(new DetectedSignal
+                        {
+                            SignalType = "newsletter_sender",
+                            Field = "isJobApplication",
+                            Value = "false",
+                            Confidence = 85,
+                            Source = "sender",
+                            Pattern = pattern
+                        });
+                        _logger.LogDebug($"  ✗ Newsletter detected via sender + content: {pattern}");
+                        return;
+                    }
+                }
+            }
+
+            // LinkedIn specific alerts
+            if (fromEmail.Contains("linkedin"))
+            {
+                var linkedInAlertPatterns = new[]
+                {
+                    @"jobs? you may be interested in",
+                    @"jobs? for you",
+                    @"\d+ new jobs?",
+                    @"jobs? in .+ are hiring",
+                    @"your job alert for"
+                };
+
+                foreach (var pattern in linkedInAlertPatterns)
+                {
+                    if (Regex.IsMatch(content, pattern, RegexOptions.IgnoreCase))
+                    {
+                        signals.IsJobApplication = false;
+                        signals.Signals.Add(new DetectedSignal
+                        {
+                            SignalType = "linkedin_alert",
+                            Field = "isJobApplication",
+                            Value = "false",
+                            Confidence = 95,
+                            Source = "content",
+                            Pattern = pattern
+                        });
+                        _logger.LogDebug($"  ✗ LinkedIn job alert detected: {pattern}");
+                        return;
+                    }
+                }
+            }
+
+            // If none of the negative patterns matched, it's likely a real application email
+            signals.IsJobApplication = true;
+        }
+
+        #endregion
 
         #region Position Detection
 
@@ -338,8 +520,9 @@ namespace JobTrackerApi.Services
 
         private string CleanCompanyName(string company)
         {
-            company = Regex.Replace(company, @"\s+(Inc\.?|LLC|Ltd\.?|Corp\.?|Corporation|Limited)$", "", RegexOptions.IgnoreCase);
-            return company.Trim();
+            // Only clean up trailing punctuation and whitespace, preserve company suffixes (Corp, Inc, etc.)
+            company = company.Trim().TrimEnd('.', ',');
+            return company;
         }
 
         #endregion

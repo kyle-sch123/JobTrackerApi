@@ -32,6 +32,19 @@ namespace JobTrackerApi.Services
 
             // Step 1: Try rule-based extraction (fast, free, deterministic)
             var signals = _ruleParser.ParseEmail(email);
+
+            // Step 2: Check if rule-based detected this as NOT a job application
+            if (!signals.IsJobApplication)
+            {
+                _logger.LogInformation($"🚫 Rule-based detected non-application email (newsletter/alert/posting)");
+                return new EmailExtractedData
+                {
+                    IsJobApplication = false,
+                    Confidence = 0,
+                    ExtractionMethod = "rule-based-rejected"
+                };
+            }
+
             var strategy = DetermineParsingStrategy(signals);
 
             _logger.LogInformation(
@@ -73,7 +86,7 @@ namespace JobTrackerApi.Services
             _logger.LogInformation(
                 $"✅ FINAL: Company='{finalResult.CompanyName}', Position='{finalResult.Position}', " +
                 $"Status={finalResult.ApplicationStatus}, Confidence={finalResult.Confidence:F1}%, " +
-                $"Method={finalResult.ExtractionMethod}"
+                $"Method={finalResult.ExtractionMethod}, IsJobApplication={finalResult.IsJobApplication}"
             );
 
             return finalResult;
@@ -248,6 +261,9 @@ Return JSON with ONLY the fields that need refinement. If a field already has hi
             // Clamp to 0-100
             merged.Confidence = Math.Clamp(merged.Confidence, 0, 100);
 
+            // Preserve IsJobApplication from LLM result (LLM has better judgment on this)
+            merged.IsJobApplication = llmResult.IsJobApplication;
+
             return merged;
         }
 
@@ -265,7 +281,8 @@ Return JSON with ONLY the fields that need refinement. If a field already has hi
                 SalaryRange = signals.SalaryRange,
                 InterviewType = signals.InterviewType,
                 Confidence = signals.OverallConfidence,
-                ExtractionMethod = "rule-based"
+                ExtractionMethod = "rule-based",
+                IsJobApplication = signals.IsJobApplication
             };
         }
 

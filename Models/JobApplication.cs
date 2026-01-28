@@ -64,6 +64,12 @@ public class JobApplication
     [BsonElement("autoCreated")]
     public bool AutoCreated { get; set; } = false; // Was this created by AI?
 
+    [BsonElement("originalCompany")]
+    public string? OriginalCompany { get; set; } // Original AI-extracted company name (used for matching)
+
+    [BsonElement("originalPosition")]
+    public string? OriginalPosition { get; set; } // Original AI-extracted position (used for matching)
+
     [BsonElement("aiConfidence")]
     public double? AiConfidence { get; set; } // 0-100 confidence score
 

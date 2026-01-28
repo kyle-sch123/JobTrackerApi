@@ -67,7 +67,7 @@ namespace JobTrackerApi.Services
         }
 
         private async Task<JobApplication?> FindExactMatch(
-            string userId, 
+            string userId,
             EmailExtractedData extractedData)
         {
             var companyVariations = GenerateCompanyVariations(extractedData.CompanyName ?? "");
@@ -79,31 +79,44 @@ namespace JobTrackerApi.Services
                 .ToListAsync();
 
             return applications.FirstOrDefault(app =>
-                companyVariations.Any(variation => 
-                    app.company.Equals(variation, StringComparison.OrdinalIgnoreCase)) &&
-                positionVariations.Any(variation =>
+                // Match against current company name OR original (AI-extracted) company name
+                (companyVariations.Any(variation =>
+                    app.company.Equals(variation, StringComparison.OrdinalIgnoreCase)) ||
+                 (!string.IsNullOrEmpty(app.OriginalCompany) &&
+                  companyVariations.Any(variation =>
+                    app.OriginalCompany.Equals(variation, StringComparison.OrdinalIgnoreCase)))) &&
+                // Match against current position OR original (AI-extracted) position
+                (positionVariations.Any(variation =>
                     app.jobTitle.Contains(variation, StringComparison.OrdinalIgnoreCase) ||
-                    variation.Contains(app.jobTitle, StringComparison.OrdinalIgnoreCase))
+                    variation.Contains(app.jobTitle, StringComparison.OrdinalIgnoreCase)) ||
+                 (!string.IsNullOrEmpty(app.OriginalPosition) &&
+                  positionVariations.Any(variation =>
+                    app.OriginalPosition.Contains(variation, StringComparison.OrdinalIgnoreCase) ||
+                    variation.Contains(app.OriginalPosition, StringComparison.OrdinalIgnoreCase))))
             );
         }
 
         private async Task<JobApplication?> FindFuzzyMatch(
-            string userId, 
+            string userId,
             EmailExtractedData extractedData)
         {
             var companyVariations = GenerateCompanyVariations(extractedData.CompanyName ?? "");
 
             // Find most recent application to this company (within last 90 days)
             var cutoffDate = DateTime.UtcNow.AddDays(-90);
-            
+
             var applications = await _jobApplicationCollection
                 .Find(x => x.userId == userId && x.applicationDate >= cutoffDate)
                 .SortByDescending(x => x.applicationDate)
                 .ToListAsync();
 
             return applications.FirstOrDefault(app =>
+                // Match against current company name OR original (AI-extracted) company name
                 companyVariations.Any(variation =>
-                    app.company.Equals(variation, StringComparison.OrdinalIgnoreCase))
+                    app.company.Equals(variation, StringComparison.OrdinalIgnoreCase)) ||
+                (!string.IsNullOrEmpty(app.OriginalCompany) &&
+                 companyVariations.Any(variation =>
+                    app.OriginalCompany.Equals(variation, StringComparison.OrdinalIgnoreCase)))
             );
         }
 

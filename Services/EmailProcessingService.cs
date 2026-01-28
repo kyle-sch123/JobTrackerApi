@@ -91,7 +91,25 @@ namespace JobTrackerApi.Services
 
                 await _processedEmailCollection.UpdateOneAsync(e => e.Id == email.Id, emailUpdate);
 
-                // Step 2: Determine action based on confidence
+                // Step 2: Check if this is actually a job application email
+                if (!extractedData.IsJobApplication)
+                {
+                    _logger.LogInformation($"🚫 Email {email.GmailMessageId} flagged as non-job-application (newsletter/alert/posting)");
+
+                    var notJobAppUpdate = Builders<ProcessedEmail>.Update
+                        .Set(e => e.ProcessingStatus, "skipped_not_job_application")
+                        .Set(e => e.ProcessedAt, DateTime.UtcNow);
+
+                    await _processedEmailCollection.UpdateOneAsync(e => e.Id == email.Id, notJobAppUpdate);
+
+                    result.Success = true;
+                    result.Action = "skipped_not_job_application";
+                    result.Message = "Email identified as newsletter/job alert/posting, not an actual application response";
+
+                    return result;
+                }
+
+                // Step 3: Determine action based on confidence
                 if (forceProcess || _hybridParser.ShouldAutoProcess(extractedData.Confidence))
                 {
                     result.Action = "auto_processed";
@@ -239,6 +257,9 @@ namespace JobTrackerApi.Services
                 status = "Applied";
             }
 
+            var confidenceLevel = extractedData.Confidence >= 80 ? "High" :
+                                  extractedData.Confidence >= 50 ? "Medium" : "Low";
+
             return new JobApplication
             {
                 userId = email.UserId,
@@ -246,10 +267,15 @@ namespace JobTrackerApi.Services
                 jobTitle = position,
                 status = status,
                 applicationDate = email.Date,
-                notes = $"Auto-created from email: {email.Subject}\n" +
-                       $"Extraction method: {extractedData.ExtractionMethod}\n" +
-                       $"Confidence: {extractedData.Confidence:F0}%\n" +
-                       $"Original From: {email.From}",
+                notes = $"[AI-Generated Application]\n" +
+                       $"This job application was automatically created by AI from your email.\n\n" +
+                       $"Source Email: {email.Subject}\n" +
+                       $"From: {email.From}\n" +
+                       $"Date: {email.Date:yyyy-MM-dd HH:mm}\n\n" +
+                       $"AI Extraction Details:\n" +
+                       $"- Method: {extractedData.ExtractionMethod}\n" +
+                       $"- Confidence: {extractedData.Confidence:F0}% ({confidenceLevel})\n" +
+                       (extractedData.Confidence < 70 ? "- Note: Low confidence - please verify the details are correct\n" : ""),
 
                 RecruiterName = extractedData.RecruiterName,
                 RecruiterEmail = extractedData.RecruiterEmail ?? email.FromEmail,
@@ -257,6 +283,8 @@ namespace JobTrackerApi.Services
                 InterviewType = extractedData.InterviewType,
                 SalaryRange = extractedData.SalaryRange,
                 AutoCreated = true,
+                OriginalCompany = extractedData.CompanyName,
+                OriginalPosition = extractedData.Position,
                 AiConfidence = extractedData.Confidence,
                 RequiresReview = extractedData.Confidence < 70,
                 EmailIds = new List<string> { email.Id! },

@@ -487,8 +487,9 @@ CRITICAL RULES:
         {
             if (string.IsNullOrWhiteSpace(companyName)) return "Unknown Company";
 
-            companyName = Regex.Replace(companyName, @"\s+(Inc\.?|LLC|Ltd\.?|Corp\.?|Corporation|Limited)$", "", RegexOptions.IgnoreCase);
-            return companyName.Trim();
+            // Only clean up trailing punctuation and whitespace, preserve company suffixes (Corp, Inc, etc.)
+            companyName = companyName.Trim().TrimEnd('.', ',');
+            return companyName;
         }
 
         private EmailExtractedData CreateFallbackExtraction(ProcessedEmail email)
