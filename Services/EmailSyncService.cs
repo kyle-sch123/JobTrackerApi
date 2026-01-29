@@ -95,6 +95,14 @@ namespace JobTrackerApi.Services
                             email.AiParsed = true;
                             email.IsJobRelated = true;
 
+                            // Check if AI determined this is actually a job application
+                            if (!extracted.IsJobApplication || extracted.Confidence == 0)
+                            {
+                                _logger.LogInformation($"🚫 AI determined email is not a job application: {email.Subject}");
+                                email.ProcessingStatus = "skipped_not_application";
+                                continue;
+                            }
+
                             // Try to match existing job by job URL or company+position
                             JobApplication? match = null;
                             var existingJobs = await _jobService.GetByUserAsync(userId);
