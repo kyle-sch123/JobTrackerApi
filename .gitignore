@@ -46,6 +46,9 @@ packages/
 csx/
 *.build.csdef
 
+#CLAUDE files
+CLAUDE.local.md
+
 # Temporary files
 *.tmp
 *.temp

@@ -416,6 +416,13 @@ namespace JobTrackerApi.Services
                 .FirstOrDefaultAsync();
         }
 
+        public async Task<ProcessedEmail?> GetEmailByGmailIdAsync(string gmailMessageId, string userId)
+        {
+            return await _processedEmailCollection
+                .Find(e => e.GmailMessageId == gmailMessageId && e.UserId == userId)
+                .FirstOrDefaultAsync();
+        }
+
         public async Task<object> GetProcessingStatsAsync(string userId)
         {
             var allEmails = await _processedEmailCollection

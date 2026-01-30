@@ -311,6 +311,87 @@ namespace JobTrackerApi.Controllers
             }
         }
 
+        // POST: api/email-processing/reprocess/{emailId}
+        // Force reprocess an email that was incorrectly skipped
+        [HttpPost("reprocess/{emailId}")]
+        public async Task<IActionResult> ReprocessEmail(string emailId)
+        {
+            try
+            {
+                var userId = GetUserId();
+
+                _logger.LogInformation($"Force reprocessing email {emailId} for user {userId}");
+
+                var email = await _processingService.GetEmailByIdAsync(emailId, userId);
+                if (email == null)
+                {
+                    return NotFound(new { error = "Email not found or does not belong to user" });
+                }
+
+                // Force process bypasses the job-related filter
+                var result = await _processingService.ProcessEmailWithHybridAsync(email, forceProcess: true);
+
+                return Ok(new
+                {
+                    message = "Email reprocessed",
+                    email = new
+                    {
+                        id = email.Id,
+                        subject = email.Subject,
+                        from = email.From,
+                        previousStatus = email.ProcessingStatus
+                    },
+                    result
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, $"Failed to reprocess email {emailId}");
+                return StatusCode(500, new { error = ex.Message });
+            }
+        }
+
+        // POST: api/email-processing/reprocess-by-gmail-id/{gmailMessageId}
+        // Force reprocess an email by Gmail message ID
+        [HttpPost("reprocess-by-gmail-id/{gmailMessageId}")]
+        public async Task<IActionResult> ReprocessEmailByGmailId(string gmailMessageId)
+        {
+            try
+            {
+                var userId = GetUserId();
+
+                _logger.LogInformation($"Force reprocessing email by Gmail ID {gmailMessageId} for user {userId}");
+
+                var email = await _processingService.GetEmailByGmailIdAsync(gmailMessageId, userId);
+                if (email == null)
+                {
+                    return NotFound(new { error = "Email not found or does not belong to user" });
+                }
+
+                // Force process bypasses the job-related filter
+                var result = await _processingService.ProcessEmailWithHybridAsync(email, forceProcess: true);
+
+                return Ok(new
+                {
+                    message = "Email reprocessed",
+                    email = new
+                    {
+                        id = email.Id,
+                        gmailMessageId = email.GmailMessageId,
+                        subject = email.Subject,
+                        from = email.From,
+                        previousStatus = email.ProcessingStatus
+                    },
+                    result
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, $"Failed to reprocess email by Gmail ID {gmailMessageId}");
+                return StatusCode(500, new { error = ex.Message });
+            }
+        }
+
         // POST: api/email-processing/reject/{emailId}
         // Reject an email from processing (mark as ignored)
         [HttpPost("reject/{emailId}")]

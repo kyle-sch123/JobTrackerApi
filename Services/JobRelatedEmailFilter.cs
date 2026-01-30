@@ -35,10 +35,12 @@ namespace JobTrackerApi.Services
         // Strong indicators of application RESPONSE emails
         private readonly string[] _applicationResponseIndicators = {
             "application received", "we received your application", "thank you for applying",
-            "your application has been", "application confirmation", "interview invitation",
-            "schedule an interview", "phone screen", "video interview", "interview scheduled",
-            "offer letter", "we'd like to offer", "pleased to offer", "regret to inform",
-            "not moving forward", "we have decided", "assessment", "coding challenge"
+            "your application has been", "your application for", "application confirmation",
+            "has been sent", "has been submitted", "successfully applied",
+            "interview invitation", "schedule an interview", "phone screen", "video interview",
+            "interview scheduled", "offer letter", "we'd like to offer", "pleased to offer",
+            "regret to inform", "not moving forward", "we have decided", "assessment",
+            "coding challenge"
         };
 
         // Indicators of job alerts/newsletters (false positives)
