@@ -1,262 +1,449 @@
-# Job Tracker API
+# JobTrackerApi — Backend
 
-A .NET 9.0 Web API for tracking job applications with automated email synchronization and AI-powered email parsing capabilities.
+ASP.NET Core 9 / C# 13 Web API that ingests Gmail messages, classifies and
+parses job-related emails with a hybrid rule-based + Claude pipeline, and
+maintains a per-user list of job applications in MongoDB.
 
-## Overview
+> Known issues and gaps are tracked in [`./Issues.md`](./Issues.md).
+> This README documents what the code **does** today, not what we wish it did.
 
-Job Tracker API is an ASP.NET Core application that helps users manage their job search by automatically syncing and parsing job-related emails from Gmail. The system uses a hybrid approach combining rule-based parsing with Claude AI to extract structured data from application confirmations, interview invitations, rejection notices, and offer letters.
+---
 
-## Features
+## Stack
 
-- **Job Application Management**: Full CRUD operations for tracking job applications
-- **Gmail Integration**: OAuth-based connection to automatically sync job-related emails
-- **AI-Powered Email Parsing**: Hybrid parsing system using Claude AI and rule-based extraction
-- **Intelligent Application Matching**: Automatically links emails to existing applications
-- **Background Email Synchronization**: Scheduled sync via Hangfire
-- **Firebase Authentication**: Secure API endpoints with Firebase Admin SDK
-- **MongoDB Storage**: Persistent storage for all application data
+| Concern | Choice |
+|---|---|
+| Runtime | .NET 9, ASP.NET Core (`Microsoft.NET.Sdk.Web`) |
+| Persistence | MongoDB (`MongoDB.Driver` 3.5.0) |
+| Auth | Firebase Admin (`FirebaseAdmin` 3.4.0) via custom middleware |
+| Gmail | `Google.Apis.Gmail.v1` + `Google.Apis.Auth` (OAuth 2.0) |
+| AI parsing | Anthropic Messages API (Claude), called over HTTP |
+| Background jobs | Hangfire on Mongo storage (`Hangfire.Mongo` 1.12.2) |
+| API docs | OpenAPI + NSwag Swagger UI (development only) |
+| Config | `DotNetEnv` (`.env` loaded at startup) |
 
-## Prerequisites
+Listens on `http://0.0.0.0:5000` by default (`Program.cs`). CORS is set to
+`AllowAnyOrigin/Method/Header`.
 
-- .NET 9.0 SDK
-- MongoDB instance
-- Firebase project (for authentication)
-- Google Cloud project with Gmail API enabled
-- Anthropic API key (for Claude AI parsing)
+---
 
-## Installation
+## Project layout
 
-1. Clone the repository
-2. Create a `.env` file in the project root (see Configuration section)
-3. Restore dependencies:
-   ```bash
-   dotnet restore
-   ```
-4. Build the project:
-   ```bash
-   dotnet build
-   ```
-5. Run the application:
-   ```bash
-   dotnet run
-   ```
-
-The API will start on `http://0.0.0.0:5000`.
-
-## Configuration
-
-Create a `.env` file in the project root with the following variables:
-
-### Database Configuration
-```env
-ConnectionString=<your-mongodb-connection-string>
-DatabaseName=<your-database-name>
-JobApplicationCollectionName=<collection-name-for-jobs>
-UserEmailConnectionCollectionName=<collection-name-for-email-connections>
-EmailSyncHistoryCollectionName=<collection-name-for-sync-history>
-ProcessedEmailCollectionName=<collection-name-for-processed-emails>
+```
+JobTrackerApi/
+├── Program.cs                        # Startup, DI, middleware, Hangfire wiring
+├── JobTrackerApi.csproj              # Package references
+├── JobTrackerApi.http                # Sample HTTP requests
+├── appsettings.json                  # Mostly empty — values come from env vars
+├── appsettings.Development.json
+├── Dockerfile                        # SDK build → aspnet runtime
+├── docs/Controllers-api.md           # (legacy) API reference
+├── CLAUDE.local.md                   # Claude-Code notes (informational)
+│
+├── Controllers/
+│   ├── BaseController.cs             # GetUserId / GetUserEmail helpers
+│   ├── JobApplicationController.cs   # /api/jobapplications + /api/JobApplication
+│   ├── GmailAuthController.cs        # /api/auth/gmail/{connect,callback,status,disconnect}
+│   └── EmailProcessingController.cs  # /api/email-processing/*
+│
+├── Middleware/
+│   └── FirebaseAuthMiddleware.cs     # Verifies Bearer ID tokens, populates ClaimsPrincipal
+│
+├── Jobs/
+│   └── BackgroundEmailSyncJob.cs     # Hangfire recurring job → EmailSyncService.SyncAllUsersAsync
+│
+├── Models/
+│   ├── JobApplication.cs             # Job application + AI-enrichment fields
+│   ├── ProcessedEmail.cs             # Stored Gmail message + EmailExtractedData
+│   ├── UserEmailConnection.cs        # Per-user Gmail OAuth tokens (plaintext)
+│   ├── EmailSyncHistory.cs           # Per-sync-run audit record
+│   ├── EmailSignals.cs               # Rule-based parser output + ParsingStrategy enum
+│   └── JobApplicationDatabaseSettings.cs
+│
+└── Services/
+    ├── JobApplicationService.cs      # Mongo CRUD; auto-increments jobNumber per user
+    ├── GmailAuthService.cs           # OAuth URL, token exchange/refresh, disconnect
+    ├── GmailEmailService.cs          # Fetch Gmail, parse MIME, persist ProcessedEmail
+    ├── JobRelatedEmailFilter.cs      # Lightweight is-it-job-related pre-filter
+    ├── EmailSyncService.cs           # Scheduled sync path (LLM-only — see "Two pipelines")
+    ├── EmailProcessingService.cs     # Controller-driven path (hybrid + matching)
+    ├── ApplicationMatchingService.cs # Find/create-vs-update + company/title variations
+    ├── RuleBasedEmailParser.cs       # Regex-based extraction → EmailSignals
+    ├── ClaudeEmailParserService.cs   # Direct HTTP calls to Anthropic Messages API
+    ├── HybridEmailParser.cs          # Routes between rule-based / LLM-refine / LLM-full
+    └── EmailParserService.cs         # ⚠ Unused / orphan, kept for now
 ```
 
-### Firebase Configuration
-```env
-FIREBASE_PROJECT_ID=<your-firebase-project-id>
-FIREBASE_PRIVATE_KEY=<your-firebase-private-key>
-FIREBASE_CLIENT_EMAIL=<your-firebase-client-email>
+DI: every service is registered as `Singleton` in `Program.cs`;
+`BackgroundEmailSyncJob` is `Scoped` (Hangfire creates a scope per run).
+
+---
+
+## How email processing works (real behaviour)
+
+There are **two parallel pipelines** today, and they don't agree. See
+[`Issues.md`](../../Issues.md) for the "merge them" recommendation.
+
+### Pipeline A — Hangfire scheduled sync (`EmailSyncService`)
+
+```
+recurring job "email-sync-job"      ← cron */N * * * *  (EMAIL_SYNC_INTERVAL_MINUTES)
+        │
+        ▼
+BackgroundEmailSyncJob.ExecuteAsync
+        │
+        ▼
+EmailSyncService.SyncAllUsersAsync              ← iterates active connections
+        │  (1s delay between users)
+        ▼
+EmailSyncService.SyncUserEmailsAsync(uid)
+        │
+        ├── GmailEmailService.FetchNewEmailsAsync   → Mongo: processed_emails
+        │
+        └── for each new email:
+              ├── JobRelatedEmailFilter.IsJobRelated
+              │     ─ if false: mark "skipped_not_job_related"
+              │
+              └── ClaudeEmailParserService.ParseEmailAsync     ← LLM directly, no hybrid
+                    └── crude match on company OR title vs existing apps
+                          ├── match  → conservative field merge + UpdateAsync
+                          └── no match → CreateAsync (status from LLM, else "Applied")
 ```
 
-### Google OAuth Configuration
-```env
-GOOGLE_CLIENT_ID=<your-google-client-id>
-GOOGLE_CLIENT_SECRET=<your-google-client-secret>
+### Pipeline B — Controller-driven (`EmailProcessingService`)
+
+```
+POST /api/email-processing/process-pending
+        │
+        ▼
+EmailProcessingService.ProcessPendingEmailsAsync(uid)
+        │     ─ Mongo filter: IsJobRelated && !AiParsed && status=="pending"
+        │     ─ 500 ms delay between emails
+        ▼
+EmailProcessingService.ProcessEmailWithHybridAsync(email, forceProcess?)
+        │
+        ├── JobRelatedEmailFilter.IsJobRelated      (unless forced)
+        │     ─ if false: "skipped_not_job_related"
+        │
+        ├── HybridEmailParser.ParseEmailAsync
+        │     ├── RuleBasedEmailParser → EmailSignals
+        │     │     └── DetectNonApplicationEmail (newsletter/alert/posting guard)
+        │     ├── DetermineParsingStrategy
+        │     │     ├── ≥ 70 % overall + core fields present  → RuleBasedOnly
+        │     │     ├── ≥ 40 %                                → LLMRefinement
+        │     │     └── < 40 % or core fields missing         → LLMFull
+        │     └── method tag: rule-based | hybrid-refined | llm-full | rule-based-rejected
+        │
+        ├── if !IsJobApplication: "skipped_not_job_application"
+        │
+        └── route by confidence (HybridEmailParser.ShouldAutoProcess / RequiresReview):
+              ├── auto  → AutoProcessApplication
+              │             ├── ApplicationMatchingService.FindMatchingApplicationAsync
+              │             │     ├── exact (company variations × position variations)
+              │             │     └── fuzzy (same company within 90 days)
+              │             ├── ShouldCreateNew? (skip if Rejected/Interview/Offer;
+              │             │                    skip if "Applied" within 7 days of existing)
+              │             ├── create new JobApplication  OR
+              │             └── update existing (status promoted via ShouldUpdateStatus)
+              ├── review queue   → status "requires_review"
+              └── low confidence → status "ignored"
 ```
 
-### Claude AI Configuration
-```env
-CLAUDE_API_KEY=<your-anthropic-api-key>
-CLAUDE_MODEL=claude-3-5-sonnet-20241022
-CLAUDE_MAX_TOKENS=1024
-AI_CONFIDENCE_THRESHOLD_AUTO=80
-AI_CONFIDENCE_THRESHOLD_REVIEW=50
+`/test-single/{id}` and `/approve/{id}` (with optional `OverrideData`) also
+flow through `ProcessEmailWithHybridAsync`.
+
+### Confidence thresholds
+
+`HybridEmailParser` (the parser the controller pipeline uses) defaults to:
+
+| Threshold | Env var | Default |
+|---|---|---|
+| Auto-process | `AI_CONFIDENCE_THRESHOLD_AUTO` | `70` |
+| Review queue floor | `AI_CONFIDENCE_THRESHOLD_REVIEW` | `40` |
+
+`ClaudeEmailParserService` has its own (unused-in-the-real-pipeline)
+defaults of `80` / `50`. The discrepancy is tracked in `Issues.md`.
+
+### Processing-status state machine on `ProcessedEmail`
+
+```
+"pending"                     ← seeded by GmailEmailService on first fetch
+   ├─→ "skipped_not_job_related"     (filter rejected)
+   ├─→ "skipped_not_job_application" (LLM/rules said newsletter/posting)
+   ├─→ "processed"                   (linked to a JobApplication)
+   ├─→ "requires_review"             (medium confidence — needs user)
+   ├─→ "ignored"                     (low confidence OR user-rejected)
+   └─→ "failed"                      (exception during processing)
 ```
 
-### Email Sync Configuration
-```env
-EMAIL_SYNC_INTERVAL_MINUTES=15
-FRONTEND_URL_DEV=<frontend-url-for-development>
-FRONTEND_URL_PROD=<frontend-url-for-production>
-```
+---
 
-## API Endpoints
+## HTTP API
 
-### Job Applications (`/api/jobapplications`)
+All endpoints require `Authorization: Bearer <firebase-id-token>` unless
+listed under "Public paths" below. The middleware extracts the uid from the
+verified token; controllers read it via `BaseController.GetUserId()`.
 
-| Method | Route | Description |
-|--------|-------|-------------|
-| GET | `/api/jobapplications` | Get all applications for authenticated user |
-| GET | `/api/JobApplication/{id}` | Get specific application |
-| POST | `/api/jobapplications` | Create new application |
-| PUT | `/api/JobApplication/{id}` | Update application |
-| DELETE | `/api/JobApplication/{id}` | Delete application |
-| PATCH | `/api/JobApplication/{id}/status` | Update status only |
+### Public paths (skipped by Firebase middleware)
 
-### Gmail Authentication (`/api/auth/gmail`)
+- `/` (exact)
+- `/health`, `/openapi`, `/swagger` (prefix)
+- `/hangfire` (prefix — note: dashboard is not actually mapped)
+- `/api/auth/gmail/callback` (Google redirects here without a token)
 
-| Method | Route | Description |
-|--------|-------|-------------|
-| GET | `/connect` | Get Google OAuth consent URL |
-| GET | `/callback` | OAuth callback handler |
-| GET | `/status` | Check Gmail connection status |
-| POST | `/disconnect` | Revoke Gmail access |
+### Job applications — `JobApplicationController`
 
-### Email Processing (`/api/email-processing`)
+Routes are a mix of `[Route("api/[controller]")]` (= `api/JobApplication`)
+and explicit `[Route("/api/jobapplications")]` overrides:
 
-| Method | Route | Description |
-|--------|-------|-------------|
-| POST | `/process-pending` | Process all pending emails |
-| GET | `/review-queue` | Get emails requiring manual review |
-| GET | `/stats` | Get processing statistics |
-| POST | `/approve/{emailId}` | Approve email for processing |
-| POST | `/reject/{emailId}` | Reject/ignore an email |
-| POST | `/test-parse` | Test parser with custom content |
+| Method | Path | Notes |
+|---|---|---|
+| GET | `/api/jobapplications` | Returns the caller's applications. ⚠ Falls back to all-users if uid is null. |
+| GET | `/api/JobApplication/{id}` | 404 if missing, 403 if not owned. |
+| POST | `/api/jobapplications` | `userId` overwritten with caller; `jobNumber` auto-incremented. |
+| PUT | `/api/JobApplication/{id}` | Preserves `Id`, `userId`, `jobNumber`. ⚠ No ownership check. |
+| DELETE | `/api/JobApplication/{id}` | ⚠ No ownership check. |
+| DELETE | `/api/JobApplication/user/{userId}` | Bulk delete. ⚠ Does not verify caller == `userId`. |
+| PATCH | `/api/JobApplication/{id}/status` | Status + `autoStatusUpdated`. ⚠ No ownership check. |
 
-## Architecture
+`StatusUpdateRequest = { Status: string; AutoStatusUpdated: bool }`.
 
-### Services
+### Gmail OAuth — `GmailAuthController` (`/api/auth/gmail`)
 
-| Service | Description |
-|---------|-------------|
-| `JobApplicationService` | Core CRUD operations for job applications |
-| `GmailAuthService` | Gmail OAuth token management |
-| `GmailEmailService` | Fetches and filters emails from Gmail API |
-| `EmailSyncService` | Orchestrates email synchronization |
-| `ClaudeEmailParserService` | AI-powered email parsing using Claude |
-| `RuleBasedEmailParser` | Pattern-based email parsing with regex |
-| `HybridEmailParser` | Combines AI and rule-based parsing strategies |
-| `JobRelatedEmailFilter` | Pre-filters emails before processing |
-| `ApplicationMatchingService` | Links emails to existing applications |
-| `EmailProcessingService` | Processes and stores parsed email data |
+| Method | Path | Notes |
+|---|---|---|
+| GET | `/connect` | Returns `{ authUrl, state }`. `state` = base64(JSON `{userId, state}`); the URL is hand-built (scope = `gmail.readonly`, `access_type=offline`, `prompt=consent`). |
+| GET | `/callback` | Public. Exchanges `?code` → tokens via `GoogleAuthorizationCodeFlow`. Resolves `userId` from `?userId` or by decoding `?state`. Redirects to `${FRONTEND_URL_{DEV,PROD}}/settings?gmail={connected,error}`. |
+| GET | `/status` | `{ connected: false }` or `{ connected: true, email, connectedAt, lastSyncAt, lastSyncStatus }`. |
+| POST | `/disconnect` | Sets `IsActive=false`. ⚠ Does **not** call Google's revoke endpoint. |
 
-### Email Parsing Strategy
+### Email processing — `EmailProcessingController` (`/api/email-processing`)
 
-The system uses a three-tier confidence-based approach:
+| Method | Path | Notes |
+|---|---|---|
+| POST | `/process-pending` | Runs Pipeline B over the caller's `pending && job-related && !AiParsed` emails. |
+| POST | `/test-parse` | Body = `TestEmailRequest`. ⚠ Calls Claude directly, **not** the hybrid parser. |
+| POST | `/test-single/{emailId}` | Runs hybrid on one stored email. |
+| GET | `/review-queue` | Emails with status `requires_review`. |
+| GET | `/test-claude` | Diagnostic ping to Anthropic. ⚠ Response includes first 20 chars of `CLAUDE_API_KEY`. |
+| GET | `/stats` | Per-user rollup; counts in process from a full collection scan. |
+| POST | `/approve/{emailId}` | Optional `{ overrideData }`. Force-processes regardless of confidence. |
+| POST | `/reprocess/{emailId}` | Force re-parse by Mongo id (undocumented in the old README). |
+| POST | `/reprocess-by-gmail-id/{gmailMessageId}` | Force re-parse by Gmail message id. |
+| POST | `/reject/{emailId}` | Marks `processingStatus = "ignored"`. |
 
-1. **Rule-Based Only** (High Confidence ≥80%): Fast regex parsing handles clear-cut cases
-2. **LLM Refinement** (Medium Confidence 50-80%): AI refines specific uncertain fields
-3. **Full LLM Parsing** (Low Confidence <50%): Complete AI analysis for complex emails
-
-### Background Jobs
-
-Hangfire manages background processing with MongoDB storage:
-
-- **Email Sync Job**: Runs at configurable intervals (default: 15 minutes)
-- Syncs emails from all connected Gmail accounts
-- Processes new emails through the parsing pipeline
-
-### Authentication
-
-All API endpoints (except health checks and OAuth callbacks) are protected via Firebase token validation. The middleware extracts user identity from JWT claims and populates the request context.
-
-**Public Paths:**
-- `/health` - Health check
-- `/swagger`, `/openapi` - API documentation
-- `/hangfire` - Job dashboard (uses its own auth)
-- `/api/auth/gmail/callback` - OAuth callback
-
-## Data Models
-
-### JobApplication
+DTOs:
 
 ```csharp
-public class JobApplication
-{
-    public string Id { get; set; }
-    public string userId { get; set; }
-    public string jobTitle { get; set; }
-    public string company { get; set; }
-    public string status { get; set; }  // Applied, Interview Scheduled, Rejected, Offer, In Progress
-    public DateTime applicationDate { get; set; }
-    public string notes { get; set; }
-    
-    // AI-extracted fields
-    public string? RecruiterName { get; set; }
-    public string? RecruiterEmail { get; set; }
-    public DateTime? InterviewDate { get; set; }
-    public string? InterviewType { get; set; }
-    public string? SalaryRange { get; set; }
-    
-    // AI metadata
-    public bool AutoCreated { get; set; }
-    public double? AiConfidence { get; set; }
-    public bool RequiresReview { get; set; }
-}
+class TestEmailRequest  { string Subject; string From; string FromEmail; string Body; }
+class ApprovalRequest   { EmailExtractedData? OverrideData; }
 ```
 
-### ProcessedEmail
+---
+
+## Data model (Mongo)
+
+Five collections (names come from env vars):
+
+| Collection | Model | Used by |
+|---|---|---|
+| `JobApplicationCollectionName` | `JobApplication` | `JobApplicationService`, `ApplicationMatchingService` |
+| `ProcessedEmailCollectionName` | `ProcessedEmail` | `GmailEmailService`, `EmailProcessingService` |
+| `UserEmailConnectionCollectionName` | `UserEmailConnection` | `GmailAuthService`, `EmailSyncService` |
+| `EmailSyncHistoryCollectionName` | `EmailSyncHistory` | `EmailSyncService` |
+| (Hangfire) | internal | Hangfire (prefix `hangfire`) |
+
+There are **no indexes created by application code**; dedup relies on
+`Find().AnyAsync()` rather than unique constraints.
+
+### `JobApplication` (selected fields)
+
+Core: `Id`, `jobNumber`, `userId`, `jobTitle`, `company`, `status`,
+`applicationDate`, `notes`, `autoStatusUpdated`, `createdAt`, `updatedAt`.
+
+AI-enrichment: `RecruiterName`, `RecruiterEmail`, `RecruiterPhone`,
+`InterviewDate`, `InterviewType`, `SalaryRange`, `EmailIds[]`,
+`AutoCreated`, `OriginalCompany`, `OriginalPosition`, `AiConfidence`,
+`RequiresReview`, `ReviewedAt`.
+
+`OriginalCompany`/`OriginalPosition` capture what the AI first extracted —
+they're used by `ApplicationMatchingService` so later emails still match
+even after the user renames the application.
+
+### `ProcessedEmail`
+
+`Id`, `userId`, `gmailMessageId`, `threadId`, `subject`, `from`, `fromEmail`,
+`to`, `date`, `snippet`, `bodyPlainText`, `bodyHtml`, `labels[]`,
+`isJobRelated`, `jobApplicationId?`, `processedAt`, `processingStatus`,
+`aiParsed`, `extractedData: EmailExtractedData?`, `extractionMethod?`.
+
+`EmailExtractedData`: `companyName`, `position`, `applicationStatus`,
+`interviewDate`, `interviewType`, `recruiterName`, `recruiterEmail`,
+`jobUrl`, `salaryRange`, `confidence` (0-100), `extractionMethod`,
+`isJobApplication`, `description`.
+
+JSON serialization: `Program.cs` sets `PropertyNamingPolicy = null` so field
+names go over the wire **exactly as declared** in C# (mixed camelCase /
+PascalCase — the frontend needs to match).
+
+---
+
+## Authentication
+
+`Middleware/FirebaseAuthMiddleware.cs`:
+
+1. If path is on the public list → pass through.
+2. Pull `Bearer …` from `Authorization`. Strip CR/LF/spaces (paste hygiene).
+3. Reject 401 if the cleaned token isn't a 3-segment JWT (`dotCount != 2`).
+4. `FirebaseAuth.DefaultInstance.VerifyIdTokenAsync(token)`.
+5. On success, populate
+   - `HttpContext.Items["UserId"]` = uid
+   - `HttpContext.Items["FirebaseToken"]` = decoded token
+   - `HttpContext.User` = `ClaimsPrincipal` with `NameIdentifier`,
+     `firebase_uid`, and (if present in the token) `Email` claims.
+
+`BaseController.GetUserId()` reads `user_id` → `sub` → `NameIdentifier` in
+that order. In practice only `NameIdentifier` is set, so that's what wins.
+
+Diagnostic logging is verbose (token length / dot count / prefix / suffix
+on every request). Demote in production.
+
+---
+
+## Environment variables
+
+Loaded from `.env` (via `DotNetEnv`) at startup and pushed into the
+`IConfiguration` "JobApplicationDatabase:*" keys.
+
+### Database
+
+```env
+ConnectionString=mongodb://...
+DatabaseName=JobTracker
+JobApplicationCollectionName=job_applications
+UserEmailConnectionCollectionName=user_email_connections
+EmailSyncHistoryCollectionName=email_sync_history
+ProcessedEmailCollectionName=processed_emails
+```
+
+### Firebase Admin (server-side token verification)
+
+```env
+FIREBASE_PROJECT_ID=...
+FIREBASE_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
+FIREBASE_CLIENT_EMAIL=firebase-adminsdk-xxxxx@<project>.iam.gserviceaccount.com
+```
+
+`Program.cs` does `Replace("\\n", "\n").Replace("\"","")` on the private
+key before composing the credentials JSON. Wrap the value in quotes in
+your shell so the literal `\n`s arrive intact; remove surrounding quotes
+yourself if your tooling adds them. (See `Issues.md` for the brittleness.)
+
+### Google OAuth (Gmail)
+
+```env
+GOOGLE_CLIENT_ID=...
+GOOGLE_CLIENT_SECRET=...
+GOOGLE_REDIRECT_URI_DEV=http://localhost:5000/api/auth/gmail/callback
+GOOGLE_REDIRECT_URI_PROD=https://your-api.example.com/api/auth/gmail/callback
+```
+
+### Frontend redirects (post-OAuth)
+
+```env
+ASPNETCORE_ENVIRONMENT=Development   # picks DEV vs PROD branches
+FRONTEND_URL_DEV=http://localhost:3000
+FRONTEND_URL_PROD=https://your-frontend.example.com
+```
+
+### Claude / Anthropic
+
+```env
+CLAUDE_API_KEY=sk-ant-...
+CLAUDE_MODEL=claude-3-5-sonnet-20241022   # default if unset
+CLAUDE_MAX_TOKENS=1024                    # default if unset
+AI_CONFIDENCE_THRESHOLD_AUTO=70           # default 70 in HybridEmailParser
+AI_CONFIDENCE_THRESHOLD_REVIEW=40         # default 40 in HybridEmailParser
+```
+
+### Background sync
+
+```env
+EMAIL_SYNC_INTERVAL_MINUTES=15            # cron is "*/N * * * *"
+```
+
+---
+
+## Running
+
+```bash
+# from backend/JobTrackerApi
+dotnet restore
+dotnet build
+dotnet run           # http://0.0.0.0:5000
+# or
+dotnet watch run
+```
+
+In Development, OpenAPI is available at `/openapi/v1.json` and Swagger UI at
+`/swagger`.
+
+### Docker
+
+```bash
+# from backend/JobTrackerApi
+docker build -t job-tracker-api .
+docker run --rm -p 8080:8080 \
+  -e ASPNETCORE_URLS=http://+:8080 \
+  --env-file .env \
+  job-tracker-api
+```
+
+⚠ The Dockerfile `EXPOSE`s 8080 but `Program.cs` hard-codes
+`UseUrls("http://0.0.0.0:5000")`. Override with `ASPNETCORE_URLS` as above,
+or change the code. See `Issues.md`.
+
+---
+
+## Background jobs
 
 ```csharp
-public class ProcessedEmail
-{
-    public string? Id { get; set; }
-    public string UserId { get; set; }
-    public string GmailMessageId { get; set; }
-    public string Subject { get; set; }
-    public string From { get; set; }
-    public DateTime Date { get; set; }
-    public string? BodyPlainText { get; set; }
-    
-    // Processing metadata
-    public bool IsJobRelated { get; set; }
-    public string? JobApplicationId { get; set; }
-    public string ProcessingStatus { get; set; }  // pending, processed, failed, ignored
-    public EmailExtractedData? ExtractedData { get; set; }
-}
+// Program.cs
+recurringJobManager.AddOrUpdate<BackgroundEmailSyncJob>(
+    "email-sync-job",
+    job => job.ExecuteAsync(),
+    $"*/{syncIntervalMinutes} * * * *"
+);
 ```
 
-## Dependencies
+- Worker count: 1 (`AddHangfireServer(o => o.WorkerCount = 1)`).
+- Storage: same Mongo instance, collection prefix `hangfire`.
+- Backup strategy: `CollectionMongoBackupStrategy` (snapshots collections
+  during Hangfire migrations).
+- Hangfire dashboard: **not** currently mounted (the auth filter exists
+  but `app.UseHangfireDashboard(...)` is never called).
 
-| Package | Version | Purpose |
-|---------|---------|---------|
-| Anthropic | 10.1.2 | Claude AI API client |
-| MongoDB.Driver | 3.5.0 | Database access |
-| FirebaseAdmin | 3.4.0 | Authentication |
-| Google.Apis.Gmail.v1 | 1.70.0.3833 | Gmail integration |
-| Google.Apis.Auth | 1.72.0 | Google OAuth |
-| Hangfire.AspNetCore | 1.8.22 | Background jobs |
-| Hangfire.Mongo | 1.12.2 | Job storage |
-| NSwag.AspNetCore | 14.5.0 | API documentation |
-| DotNetEnv | 3.1.1 | Environment configuration |
+---
 
-## API Documentation
+## Adding / changing things
 
-When running in Development mode, API documentation is available:
-- **Swagger UI**: `/swagger`
-- **OpenAPI spec**: `/openapi/v1.json`
+- **New rule-based extraction pattern**: edit `Services/RuleBasedEmailParser.cs`
+  in the relevant `DetectXxx` region; each pattern carries its own
+  confidence.
+- **New non-application heuristic**: add to `DetectNonApplicationEmail`
+  (newsletter / alert / "is hiring" guard).
+- **Tweak Claude prompt**: `ClaudeEmailParserService.BuildPrompt`. The
+  system prompt is inlined in `ParseEmailAsync`.
+- **Tweak confidence routing**: `HybridEmailParser.DetermineParsingStrategy`
+  + `HybridEmailParser.ShouldAutoProcess/RequiresReview`.
+- **Tweak duplicate-detection**: `ApplicationMatchingService`
+  (`_companyVariations`-style helpers, `ShouldCreateNew`).
 
-## Development
+---
 
-### Local URLs
+## Known issues
 
-| Profile | URL |
-|---------|-----|
-| HTTP | `http://localhost:5160` |
-| HTTPS | `https://localhost:7037` |
-
-### Logging
-
-- **Development**: Debug-level logging enabled
-- **Production**: Information-level logging (configurable in `appsettings.json`)
-
-### CORS
-
-The API is configured with a permissive CORS policy for development. Consider restricting for production deployments.
-
-## Supported Job Platforms
-
-The parser recognizes emails from these platforms:
-- LinkedIn, Indeed, Glassdoor, PNet
-- ATS platforms: Greenhouse, Lever, Workday, BambooHR
-- SmartRecruiters, Jobvite, Broadbean
-
-## License
-
-See LICENSE file for details.
+See [`./Issues.md`](./Issues.md) — covers ownership-check gaps on
+JobApplication mutations, the two-pipeline divergence, plaintext OAuth
+tokens, the unmounted Hangfire dashboard, threshold mismatches, missing
+Mongo indexes, dead code (`EmailParserService.cs`), and more.
