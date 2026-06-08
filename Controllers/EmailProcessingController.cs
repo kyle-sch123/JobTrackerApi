@@ -9,16 +9,22 @@ namespace JobTrackerApi.Controllers
     public class EmailProcessingController : BaseController
     {
         private readonly EmailProcessingService _processingService;
-        private readonly ClaudeEmailParserService _parserService;
+        private readonly HybridEmailParser _hybridParser;
+        private readonly IHttpClientFactory _httpClientFactory;
+        private readonly IWebHostEnvironment _environment;
         private readonly ILogger<EmailProcessingController> _logger;
 
         public EmailProcessingController(
             EmailProcessingService processingService,
-            ClaudeEmailParserService parserService,
+            HybridEmailParser hybridParser,
+            IHttpClientFactory httpClientFactory,
+            IWebHostEnvironment environment,
             ILogger<EmailProcessingController> logger)
         {
             _processingService = processingService;
-            _parserService = parserService;
+            _hybridParser = hybridParser;
+            _httpClientFactory = httpClientFactory;
+            _environment = environment;
             _logger = logger;
         }
 
@@ -84,10 +90,12 @@ namespace JobTrackerApi.Controllers
                     ProcessingStatus = "pending"
                 };
 
-                var extracted = await _parserService.ParseEmailAsync(testEmail);
+                // Use the SAME hybrid parser the real pipeline uses, so the reported
+                // decision matches what processing would actually do.
+                var extracted = await _hybridParser.ParseEmailAsync(testEmail);
 
-                var shouldAutoProcess = _parserService.ShouldAutoProcess(extracted.Confidence);
-                var requiresReview = _parserService.RequiresReview(extracted.Confidence);
+                var shouldAutoProcess = _hybridParser.ShouldAutoProcess(extracted.Confidence);
+                var requiresReview = _hybridParser.RequiresReview(extracted.Confidence);
 
                 return Ok(new
                 {
@@ -205,6 +213,12 @@ namespace JobTrackerApi.Controllers
         [HttpGet("test-claude")]
         public async Task<IActionResult> TestClaude()
         {
+            // Diagnostic endpoint only — never expose in production.
+            if (!_environment.IsDevelopment())
+            {
+                return NotFound();
+            }
+
             try
             {
                 var apiKey = Environment.GetEnvironmentVariable("CLAUDE_API_KEY");
@@ -213,7 +227,8 @@ namespace JobTrackerApi.Controllers
                     return Ok(new { error = "CLAUDE_API_KEY not found in environment" });
                 }
 
-                var httpClient = new HttpClient();
+                // Reuse a pooled HttpClient from the factory (avoids socket exhaustion).
+                var httpClient = _httpClientFactory.CreateClient();
                 httpClient.DefaultRequestHeaders.Add("x-api-key", apiKey);
                 httpClient.DefaultRequestHeaders.Add("anthropic-version", "2023-06-01");
 
@@ -223,12 +238,12 @@ namespace JobTrackerApi.Controllers
                     max_tokens = 100,
                     messages = new[]
                     {
-                new
-                {
-                    role = "user",
-                    content = "Say hello!"
-                }
-            }
+                        new
+                        {
+                            role = "user",
+                            content = "Say hello!"
+                        }
+                    }
                 };
 
                 var json = System.Text.Json.JsonSerializer.Serialize(requestBody);
@@ -241,13 +256,12 @@ namespace JobTrackerApi.Controllers
                 {
                     status = response.StatusCode.ToString(),
                     apiKeyPresent = !string.IsNullOrEmpty(apiKey),
-                    apiKeyPrefix = apiKey.Substring(0, Math.Min(20, apiKey.Length)) + "...",
                     response = responseContent
                 });
             }
             catch (Exception ex)
             {
-                return Ok(new { error = ex.Message, stackTrace = ex.StackTrace });
+                return Ok(new { error = ex.Message });
             }
         }
 

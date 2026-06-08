@@ -419,17 +419,20 @@ namespace JobTrackerApi.Services
             fromName = Regex.Replace(fromName, @"\s+(Team|Careers|Recruiting|HR|Jobs|Talent)$", "", RegexOptions.IgnoreCase);
             if (!string.IsNullOrEmpty(fromName) && !fromName.Contains("@") && fromName.Length > 2)
             {
+                // Low confidence: the sender display name is often an ATS/job board
+                // or team mailbox, not the actual employer. Keep it below the
+                // rule-only threshold so the LLM gets consulted to confirm.
                 signals.CompanyName = fromName;
-                signals.CompanyConfidence = 60;
+                signals.CompanyConfidence = 45;
                 signals.Signals.Add(new DetectedSignal
                 {
                     SignalType = "from_name",
                     Field = "company",
                     Value = fromName,
-                    Confidence = 60,
+                    Confidence = 45,
                     Source = "email_headers"
                 });
-                _logger.LogDebug($"  ✓ Company from sender name: '{fromName}' (60%)");
+                _logger.LogDebug($"  ? Company from sender name (low confidence): '{fromName}' (45%)");
                 return;
             }
 
@@ -446,16 +449,16 @@ namespace JobTrackerApi.Services
             {
                 var companyGuess = char.ToUpper(baseDomain[0]) + baseDomain.Substring(1);
                 signals.CompanyName = companyGuess;
-                signals.CompanyConfidence = 40;
+                signals.CompanyConfidence = 25;
                 signals.Signals.Add(new DetectedSignal
                 {
                     SignalType = "domain_fallback",
                     Field = "company",
                     Value = companyGuess,
-                    Confidence = 40,
+                    Confidence = 25,
                     Source = "email_domain"
                 });
-                _logger.LogDebug($"  ? Company guess from domain: '{companyGuess}' (40%)");
+                _logger.LogDebug($"  ? Company guess from domain (low confidence): '{companyGuess}' (25%)");
                 return;
             }
 
@@ -636,21 +639,23 @@ namespace JobTrackerApi.Services
             if (isPersonal)
             {
                 var fromName = email.From.Split('<')[0].Trim();
-                if (!string.IsNullOrEmpty(fromName) && fromName.Length > 2 && fromName.Length < 50)
+                // Only treat the sender as the contact person if the display name
+                // actually looks like a human name — not a team mailbox, ATS, or org.
+                if (LooksLikePersonName(fromName))
                 {
                     signals.RecruiterName = fromName;
                     signals.RecruiterEmail = email.FromEmail;
-                    signals.RecruiterConfidence = 80;
+                    signals.RecruiterConfidence = 70;
                     signals.Signals.Add(new DetectedSignal
                     {
                         SignalType = "personal_email",
                         Field = "recruiter",
                         Value = fromName,
-                        Confidence = 80,
+                        Confidence = 70,
                         Source = "email_headers"
                     });
 
-                    _logger.LogDebug($"  ✓ Recruiter: '{fromName}' (80%)");
+                    _logger.LogDebug($"  ✓ Recruiter: '{fromName}' (70%)");
                     return;
                 }
             }
@@ -679,6 +684,34 @@ namespace JobTrackerApi.Services
             signals.RecruiterName = null;
             signals.RecruiterEmail = null;
             signals.RecruiterConfidence = 0;
+        }
+
+        // Heuristic: does a sender display name look like an actual person (e.g.
+        // "Jane Smith") rather than a team mailbox, role, ATS, or company?
+        private static bool LooksLikePersonName(string? name)
+        {
+            if (string.IsNullOrWhiteSpace(name)) return false;
+            name = name.Trim();
+            if (name.Length < 3 || name.Length > 50) return false;
+
+            var lowered = name.ToLowerInvariant();
+            string[] nonPersonTokens =
+            {
+                "team", "careers", "recruit", "recruiting", "hr", "talent", "jobs",
+                "hiring", "no-reply", "noreply", "notification", "support", "info",
+                "hello", "people", "office", "admin", "staffing", "agency", "group",
+                "solutions", "technologies", "consulting", "inc", "llc", "ltd", "gmbh"
+            };
+            if (nonPersonTokens.Any(t => lowered.Contains(t))) return false;
+
+            // Expect 2-3 capitalized alphabetic words (allow hyphen/apostrophe).
+            var parts = name.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length < 2 || parts.Length > 3) return false;
+
+            return parts.All(p =>
+                p.Length >= 2 &&
+                char.IsUpper(p[0]) &&
+                p.All(c => char.IsLetter(c) || c == '-' || c == '\''));
         }
 
         #endregion

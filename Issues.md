@@ -10,6 +10,43 @@ Severity labels: 🔴 critical · 🟠 high · 🟡 medium · 🟢 low/polish.
 
 ## Backend
 
+> **Remediation status — updated 2026-06-08.** Most backend findings below have
+> been addressed; the original finding text is kept for reference. Build verified
+> (0 errors). Legend: ✅ fixed · 🟡 partial · ⏸️ deferred.
+>
+> **Security & authorization**
+> - ✅ Ownership checks on PUT/DELETE/PATCH + `DeleteAllForUser`; `GetAll` now 401s on a null uid.
+> - ✅ `test-claude` — key prefix removed, gated to Development, uses `IHttpClientFactory`.
+> - ✅ Gmail tokens encrypted at rest (DataProtection, with legacy-plaintext fallback).
+> - ✅ Disconnect revokes the Google grant before flipping the flag.
+> - ✅ OAuth `state` verified via `IMemoryCache` (state→userId, 10-min TTL).
+> - ✅ CORS restricted to `FRONTEND_URL_DEV/_PROD` (policy `AllowFrontend`).
+> - ✅ Dead `HangfireAuthorizationFilter` removed.
+> - ✅ Verbose token logging demoted to `LogDebug`.
+>
+> **Architecture & correctness**
+> - ✅ Unified pipelines — `EmailSyncService` delegates to `EmailProcessingService.ProcessEmailWithHybridAsync`.
+> - 🟡 Job-related filters — `GmailEmailService` now delegates to `JobRelatedEmailFilter`; `RuleBasedEmailParser.DetectNonApplicationEmail` is kept on purpose (distinct application-vs-newsletter classifier feeding `IsJobApplication`).
+> - ✅ `test-parse` uses `HybridEmailParser` and its thresholds.
+> - ✅ Thresholds centralised in `Models/ConfidenceThresholds.cs` (injected); Claude's 80/50 methods removed.
+> - ✅ Mongo indexes created at startup.
+> - ✅ `FindExactMatch`/`FindFuzzyMatch` narrow the query (company regex) instead of loading all apps.
+> - ✅ `GetProcessingStatsAsync` uses server-side counts + aggregation.
+> - ✅ Status taxonomy centralised in `Models/ApplicationStatuses.cs` (backend; the frontend set still differs).
+> - ✅ Firebase private key trims one surrounding quote pair instead of every quote.
+> - ✅ Claude calls retry with exponential backoff + `Retry-After` handling.
+> - ✅ `HttpClient` reuse via a named `IHttpClientFactory` ("claude") client.
+> - ⏸️ `GmailAuthService` OAuth URL is still hand-built (works; cosmetic — left as-is).
+>
+> **Dead code / operational**
+> - ✅ Deleted `Services/EmailParserService.cs`.
+> - ✅ Removed the empty `JobApplicationDatabase` section from `appsettings.json`.
+> - ✅ Dockerfile sets `ASPNETCORE_URLS=http://+:8080`; `Program.cs` honours `ASPNETCORE_URLS`.
+> - ✅ README rewritten (audit pass); `CLAUDE.local.md` is the owner's private file, left untouched.
+>
+> Remaining backend work: 🟡 full filter consolidation, ⏸️ the OAuth-URL builder.
+> All **Frontend** items below are untouched (separate project).
+
 ### Security & authorization
 
 - 🔴 **PUT/DELETE/PATCH on JobApplications skip ownership checks**

@@ -21,7 +21,7 @@ namespace JobTrackerApi.Middleware
             var path = context.Request.Path.Value?.ToLower() ?? "";
             if (ShouldSkipAuth(path))
             {
-                _logger.LogInformation("Skipping Firebase auth for path: {Path}", path);
+                _logger.LogDebug("Skipping Firebase auth for path: {Path}", path);
                 await _next(context);
                 return;
             }
@@ -30,8 +30,8 @@ namespace JobTrackerApi.Middleware
             {
                 var token = ExtractToken(context);
 
-                _logger.LogInformation("Authorization header present: {HasHeader}", !string.IsNullOrEmpty(context.Request.Headers["Authorization"]));
-                _logger.LogInformation("Token extracted: {HasToken}", !string.IsNullOrEmpty(token));
+                _logger.LogDebug("Authorization header present: {HasHeader}", !string.IsNullOrEmpty(context.Request.Headers["Authorization"]));
+                _logger.LogDebug("Token extracted: {HasToken}", !string.IsNullOrEmpty(token));
 
                 // Normalize token: remove whitespace/newlines that often get introduced when copying tokens
                 if (!string.IsNullOrEmpty(token))
@@ -40,7 +40,7 @@ namespace JobTrackerApi.Middleware
                     var cleanedToken = token.Replace("\r", "").Replace("\n", "").Replace(" ", "");
                     if (cleanedToken != rawToken)
                     {
-                        _logger.LogInformation("Cleaned token whitespace (was malformed by copy/paste). New length={Length}", cleanedToken.Length);
+                        _logger.LogDebug("Cleaned token whitespace (was malformed by copy/paste). New length={Length}", cleanedToken.Length);
                         token = cleanedToken;
                     }
 
@@ -50,7 +50,7 @@ namespace JobTrackerApi.Middleware
                     var prefix = tokenLen > 8 ? token.Substring(0, 8) : token;
                     var suffix = tokenLen > 8 ? token.Substring(tokenLen - 8, 8) : token;
 
-                    _logger.LogInformation("Token diagnostics: Length={Length}, Dots={DotCount}, HasWhitespace={HasWhitespace}, Prefix={Prefix}..., Suffix=...{Suffix}",
+                    _logger.LogDebug("Token diagnostics: Length={Length}, Dots={DotCount}, HasWhitespace={HasWhitespace}, Prefix={Prefix}..., Suffix=...{Suffix}",
                         tokenLen, dotCount, hasWhitespace, prefix, suffix);
 
                     if (dotCount != 2)
@@ -92,8 +92,8 @@ namespace JobTrackerApi.Middleware
                 }
                 var uid = decodedToken.Uid;
 
-                _logger.LogInformation("Firebase token verified for uid: {Uid}", uid);
-                _logger.LogInformation("Decoded token claims count: {Count}", decodedToken.Claims?.Count ?? 0);
+                _logger.LogDebug("Firebase token verified for uid: {Uid}", uid);
+                _logger.LogDebug("Decoded token claims count: {Count}", decodedToken.Claims?.Count ?? 0);
 
                 // Add user ID to HttpContext for use in controllers
                 context.Items["UserId"] = uid;
@@ -114,7 +114,7 @@ namespace JobTrackerApi.Middleware
                 var identity = new ClaimsIdentity(claims, "Firebase");
                 context.User = new ClaimsPrincipal(identity);
 
-                _logger.LogInformation("HttpContext.User populated. IsAuthenticated={IsAuthenticated}, NameIdentifier={NameId}",
+                _logger.LogDebug("HttpContext.User populated. IsAuthenticated={IsAuthenticated}, NameIdentifier={NameId}",
                     context.User?.Identity?.IsAuthenticated, context.User?.FindFirst(ClaimTypes.NameIdentifier)?.Value);
 
                 await _next(context);

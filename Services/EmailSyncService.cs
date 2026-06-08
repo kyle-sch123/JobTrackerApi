@@ -10,25 +10,19 @@ namespace JobTrackerApi.Services
         private readonly IMongoCollection<UserEmailConnection> _connectionCollection;
         private readonly GmailAuthService _authService;
         private readonly GmailEmailService _emailService;
-        private readonly ClaudeEmailParserService _parserService;
-        private readonly JobApplicationService _jobService;
-        private readonly JobRelatedEmailFilter _jobFilter;
+        private readonly EmailProcessingService _processingService;
         private readonly ILogger<EmailSyncService> _logger;
 
         public EmailSyncService(
             IOptions<JobApplicationDatabaseSettings> dbSettings,
             GmailAuthService authService,
             GmailEmailService emailService,
-            ClaudeEmailParserService parserService,
-            JobApplicationService jobService,
-            JobRelatedEmailFilter jobFilter,
+            EmailProcessingService processingService,
             ILogger<EmailSyncService> logger)
         {
             _authService = authService;
             _emailService = emailService;
-            _parserService = parserService;
-            _jobService = jobService;
-            _jobFilter = jobFilter;
+            _processingService = processingService;
             _logger = logger;
 
             var settings = dbSettings.Value;
@@ -71,91 +65,27 @@ namespace JobTrackerApi.Services
                 // Fetch new emails
                 var newEmails = await _emailService.FetchNewEmailsAsync(userId, lastSyncTime);
 
-                // Process each email: parse and create/update job applications when appropriate
+                // Process each email through the SAME unified hybrid pipeline the
+                // on-demand /process-pending endpoint uses, so a given email yields
+                // the same result whether it was synced on a schedule or processed
+                // manually. (ProcessEmailWithHybridAsync persists all state itself.)
                 var processedCount = 0;
                 foreach (var email in newEmails)
                 {
                     try
                     {
-                        // Step 1: Pre-filter - Check if email is job-related to avoid unnecessary AI calls
-                        var isJobRelated = _jobFilter.IsJobRelated(email);
+                        var result = await _processingService.ProcessEmailWithHybridAsync(email);
 
-                        if (!isJobRelated)
+                        if (result.Success &&
+                            (result.Action == "auto_processed" || result.Action == "requires_review"))
                         {
-                            _logger.LogInformation($"🚫 Email not job-related, skipping AI processing: {email.Subject}");
-                            email.IsJobRelated = false;
-                            email.ProcessingStatus = "skipped_not_job_related";
-                            email.AiParsed = false;
-                        }
-                        else
-                        {
-                            // Step 2: Parse job-related email with AI
-                            var extracted = await _parserService.ParseEmailAsync(email);
-                            email.ExtractedData = extracted;
-                            email.AiParsed = true;
-                            email.IsJobRelated = true;
-
-                            // Check if AI determined this is actually a job application
-                            if (!extracted.IsJobApplication || extracted.Confidence == 0)
-                            {
-                                _logger.LogInformation($"🚫 AI determined email is not a job application: {email.Subject}");
-                                email.ProcessingStatus = "skipped_not_application";
-                                continue;
-                            }
-
-                            // Try to match existing job by job URL or company+position
-                            JobApplication? match = null;
-                            var existingJobs = await _jobService.GetByUserAsync(userId);
-
-                            // Try to match by company + job title
-                            if (!string.IsNullOrEmpty(extracted.CompanyName) || !string.IsNullOrEmpty(extracted.Position))
-                            {
-                                match = existingJobs.FirstOrDefault(j =>
-                                    (!string.IsNullOrEmpty(extracted.CompanyName) && !string.IsNullOrEmpty(j.company) && j.company.Equals(extracted.CompanyName, StringComparison.OrdinalIgnoreCase))
-                                    || (!string.IsNullOrEmpty(extracted.Position) && !string.IsNullOrEmpty(j.jobTitle) && j.jobTitle.Equals(extracted.Position, StringComparison.OrdinalIgnoreCase))
-                                );
-                            }
-
-                            if (match != null)
-                            {
-                                // Update fields conservatively
-                                match.company = string.IsNullOrEmpty(match.company) ? (extracted.CompanyName ?? match.company) : match.company;
-                                match.jobTitle = string.IsNullOrEmpty(match.jobTitle) ? (extracted.Position ?? match.jobTitle) : match.jobTitle;
-                                match.status = extracted.ApplicationStatus ?? match.status;
-
-                                await _jobService.UpdateAsync(match.Id, match);
-                                email.JobApplicationId = match.Id;
-                            }
-                            else
-                            {
-                                // Create new job application
-                                var newJob = new JobApplication
-                                {
-                                    userId = userId,
-                                    jobTitle = extracted.Position ?? (email.Subject ?? ""),
-                                    company = extracted.CompanyName ?? "",
-                                    applicationDate = email.Date,
-                                    status = extracted.ApplicationStatus ?? "Applied"
-                                };
-
-                                await _jobService.CreateAsync(newJob);
-                                email.JobApplicationId = newJob.Id;
-                            }
-
-                            email.ProcessingStatus = "processed";
                             processedCount++;
                         }
                     }
                     catch (Exception ex)
                     {
-                        _logger.LogError(ex, "Failed to parse/process email {MessageId}", email.GmailMessageId);
-                        email.ProcessingStatus = "failed";
-                        email.AiParsed = false;
-                        email.ExtractedData = null;
+                        _logger.LogError(ex, "Failed to process email {MessageId}", email.GmailMessageId);
                     }
-
-                    // Save the updated processed email record
-                    await _emailService.UpdateProcessedEmailAsync(email);
                 }
 
                 // Update sync history

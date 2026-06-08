@@ -8,27 +8,88 @@ namespace JobTrackerApi.Services
 {
     public class ClaudeEmailParserService
     {
+        private const string ClaudeMessagesUrl = "https://api.anthropic.com/v1/messages";
+
         private readonly ILogger<ClaudeEmailParserService> _logger;
-        private readonly HttpClient _httpClient;
+        private readonly IHttpClientFactory _httpClientFactory;
         private readonly string _model;
         private readonly int _maxTokens;
-        private readonly string _apiKey;
 
-        public ClaudeEmailParserService(ILogger<ClaudeEmailParserService> logger, IConfiguration configuration)
+        public ClaudeEmailParserService(ILogger<ClaudeEmailParserService> logger, IHttpClientFactory httpClientFactory)
         {
             _logger = logger;
+            _httpClientFactory = httpClientFactory;
 
-            _apiKey = Environment.GetEnvironmentVariable("CLAUDE_API_KEY")
-                ?? throw new Exception("CLAUDE_API_KEY not found");
-
-            _httpClient = new HttpClient();
-            _httpClient.DefaultRequestHeaders.Add("x-api-key", _apiKey);
-            _httpClient.DefaultRequestHeaders.Add("anthropic-version", "2023-06-01");
+            // Fail fast at startup if the key is missing; the actual header is
+            // applied to the named "claude" HttpClient in Program.cs.
+            if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("CLAUDE_API_KEY")))
+            {
+                throw new Exception("CLAUDE_API_KEY not found");
+            }
 
             _model = Environment.GetEnvironmentVariable("CLAUDE_MODEL")
-                ?? "claude-3-5-sonnet-20241022";
+                ?? "claude-sonnet-4-6";
 
             _maxTokens = int.Parse(Environment.GetEnvironmentVariable("CLAUDE_MAX_TOKENS") ?? "1024");
+        }
+
+        /// <summary>
+        /// POSTs to the Claude Messages API with exponential backoff. Retries on
+        /// 429 (respecting Retry-After) and 5xx; returns the final response either
+        /// way so callers can fall back to heuristic extraction.
+        /// </summary>
+        private async Task<HttpResponseMessage> PostWithRetryAsync(string requestJson, int maxAttempts = 3)
+        {
+            HttpResponseMessage response = null!;
+
+            for (var attempt = 1; attempt <= maxAttempts; attempt++)
+            {
+                var httpClient = _httpClientFactory.CreateClient("claude");
+                // Content can't be reused across attempts, so build it each time.
+                var content = new StringContent(requestJson, Encoding.UTF8, "application/json");
+                response = await httpClient.PostAsync(ClaudeMessagesUrl, content);
+
+                if (response.IsSuccessStatusCode)
+                {
+                    return response;
+                }
+
+                var status = (int)response.StatusCode;
+                var retriable = status == 429 || status >= 500;
+                if (!retriable || attempt == maxAttempts)
+                {
+                    return response;
+                }
+
+                // Respect Retry-After when present, otherwise exponential backoff (2s, 4s, …).
+                TimeSpan delay;
+                if (response.Headers.RetryAfter?.Delta is TimeSpan retryAfterDelta)
+                {
+                    delay = retryAfterDelta;
+                }
+                else if (response.Headers.RetryAfter?.Date is DateTimeOffset retryAfterDate)
+                {
+                    delay = retryAfterDate - DateTimeOffset.UtcNow;
+                }
+                else
+                {
+                    delay = TimeSpan.FromSeconds(Math.Pow(2, attempt));
+                }
+
+                if (delay < TimeSpan.Zero)
+                {
+                    delay = TimeSpan.FromSeconds(1);
+                }
+
+                _logger.LogWarning(
+                    "Claude API returned {Status}; retrying in {Delay}s (attempt {Attempt}/{Max})",
+                    status, delay.TotalSeconds, attempt, maxAttempts);
+
+                response.Dispose();
+                await Task.Delay(delay);
+            }
+
+            return response;
         }
 
         public async Task<EmailExtractedData> ParseEmailAsync(ProcessedEmail email)
@@ -44,16 +105,17 @@ namespace JobTrackerApi.Services
                     model = _model,
                     max_tokens = _maxTokens,
                     temperature = 0.2,
-                    system = @"You are an expert at identifying and extracting job application data from emails.
-
-CRITICAL RULES:
-1. Only extract data from ACTUAL job application confirmation/response emails
-2. IGNORE: newsletters, job posting notifications, marketing emails, job alerts
-3. Valid emails: application confirmations, interview invitations, rejection letters, offer letters
-4. Return isJobApplication=false for non-application emails
-5. Extract position from 'application for [Position]' or 'applied to [Position]' patterns
-6. Look for company names in signatures, footers, or email addresses
-7. Return valid JSON with ALL fields present (use null for missing data)",
+                    system = ExtractionSystemPrompt,
+                    // Structured outputs: constrain the response to the schema so the
+                    // result is always valid JSON in the expected shape.
+                    output_config = new
+                    {
+                        format = new
+                        {
+                            type = "json_schema",
+                            schema = BuildExtractionSchema()
+                        }
+                    },
                     messages = new[]
                     {
                         new
@@ -65,9 +127,7 @@ CRITICAL RULES:
                 };
 
                 var json = JsonSerializer.Serialize(requestBody);
-                var content = new StringContent(json, Encoding.UTF8, "application/json");
-
-                var response = await _httpClient.PostAsync("https://api.anthropic.com/v1/messages", content);
+                var response = await PostWithRetryAsync(json);
 
                 var responseContent = await response.Content.ReadAsStringAsync();
                 _logger.LogInformation($"📥 Claude API Status: {response.StatusCode}");
@@ -98,10 +158,19 @@ CRITICAL RULES:
                     return CreateFallbackExtraction(email);
                 }
 
+                // Only a direct application response is a real "job application";
+                // job alerts, newsletters, and promotional mail are not.
+                if (!string.IsNullOrEmpty(extracted.EmailType))
+                {
+                    extracted.IsJobApplication = extracted.EmailType.Equals(
+                        "application_response", StringComparison.OrdinalIgnoreCase);
+                }
+
                 // Check if this is actually a job application email
                 if (!extracted.IsJobApplication)
                 {
-                    _logger.LogInformation($"🚫 Email {email.GmailMessageId} is not a job application (newsletter/alert/posting)");
+                    _logger.LogInformation(
+                        $"🚫 Email {email.GmailMessageId} classified as '{extracted.EmailType}' (not an application)");
                     extracted.Confidence = 0;
                     return extracted;
                 }
@@ -127,135 +196,38 @@ CRITICAL RULES:
             }
         }
 
-        public async Task<EmailExtractedData> ParseEmailWithPromptAsync(ProcessedEmail email, string customPrompt)
-        {
-            try
-            {
-                _logger.LogInformation($"📧 Parsing with custom prompt: {email.GmailMessageId}");
-
-                var requestBody = new
-                {
-                    model = _model,
-                    max_tokens = _maxTokens,
-                    temperature = 0.2,
-                    messages = new[]
-                    {
-                        new
-                        {
-                            role = "user",
-                            content = customPrompt
-                        }
-                    }
-                };
-
-                var json = JsonSerializer.Serialize(requestBody);
-                var content = new StringContent(json, Encoding.UTF8, "application/json");
-
-                var response = await _httpClient.PostAsync("https://api.anthropic.com/v1/messages", content);
-                var responseContent = await response.Content.ReadAsStringAsync();
-
-                if (!response.IsSuccessStatusCode)
-                {
-                    _logger.LogError($"❌ Claude API error: {response.StatusCode}");
-                    return CreateFallbackExtraction(email);
-                }
-
-                var claudeResponse = JsonSerializer.Deserialize<ClaudeApiResponse>(responseContent);
-                var text = ExtractText(claudeResponse);
-                var jsonText = ExtractJsonFromText(text);
-
-                var extracted = JsonSerializer.Deserialize<EmailExtractedData>(
-                    jsonText,
-                    new JsonSerializerOptions { PropertyNameCaseInsensitive = true }
-                );
-
-                if (extracted != null)
-                {
-                    PostProcessExtractedData(extracted, email);
-                    extracted.Description = "Automatically created from your email via AI";
-                    return extracted;
-                }
-
-                return CreateFallbackExtraction(email);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Custom prompt parsing failed");
-                return CreateFallbackExtraction(email);
-            }
-        }
-
         private void PostProcessExtractedData(EmailExtractedData data, ProcessedEmail email)
         {
-            // 1. Normalize confidence
+            // 1. Normalize confidence to 0-100
             if (data.Confidence <= 1.0)
             {
                 data.Confidence *= 100;
             }
             data.Confidence = Math.Clamp(data.Confidence, 0, 100);
 
-            // 2. Handle company name - FIXED LOGIC
-            bool needsCompanyFallback = string.IsNullOrWhiteSpace(data.CompanyName) ||
-                                        data.CompanyName.Equals("Unknown", StringComparison.OrdinalIgnoreCase) ||
-                                        data.CompanyName.Equals("Unknown Company", StringComparison.OrdinalIgnoreCase);
-
-            if (needsCompanyFallback)
+            // 2. Trust the model on the company name. If it returned a sentinel/unknown
+            //    value, leave it null rather than synthesizing a "Recruitment Agency
+            //    (via X)" or domain-based placeholder — that synthesis was a major
+            //    source of wrong company names. Downstream supplies a neutral
+            //    placeholder when company is missing.
+            if (!string.IsNullOrWhiteSpace(data.CompanyName))
             {
-                // Check if it's from a recruitment platform first
-                if (IsRecruitmentPlatform(email.FromEmail))
-                {
-                    data.CompanyName = DetermineRecruitmentSource(email);
-                    _logger.LogInformation($"🔍 Recruitment platform detected: '{data.CompanyName}'");
-                }
-                else
-                {
-                    // Try extracting from email
-                    var extractedCompany = ExtractCompanyFromEmail(email);
-
-                    // If extraction still fails, default to recruitment agency
-                    if (string.IsNullOrWhiteSpace(extractedCompany) ||
-                        extractedCompany.Equals("Unknown Company", StringComparison.OrdinalIgnoreCase))
-                    {
-                        data.CompanyName = DetermineRecruitmentSource(email);
-                        _logger.LogInformation($"🔍 Defaulting to recruitment source: '{data.CompanyName}'");
-                    }
-                    else
-                    {
-                        data.CompanyName = extractedCompany;
-                    }
-                }
-
-                data.Confidence = Math.Max(0, data.Confidence - 15);
-                _logger.LogInformation($"🔍 Fallback company extraction: '{data.CompanyName}'");
-            }
-            // ADDED: Even if company name exists, verify it's not "Unknown Company"
-            else if (data.CompanyName.Equals("Unknown Company", StringComparison.OrdinalIgnoreCase))
-            {
-                data.CompanyName = DetermineRecruitmentSource(email);
-                _logger.LogInformation($"🔍 Replaced 'Unknown Company' with: '{data.CompanyName}'");
+                var cleaned = CleanCompanyName(data.CompanyName);
+                data.CompanyName =
+                    cleaned.Equals("Unknown", StringComparison.OrdinalIgnoreCase) ||
+                    cleaned.Equals("Unknown Company", StringComparison.OrdinalIgnoreCase)
+                        ? null
+                        : cleaned;
             }
 
-            // 3. Fix position if missing
-            if (string.IsNullOrWhiteSpace(data.Position))
+            // 3. Validate status against the canonical taxonomy; null it out if the
+            //    model returned something off-list rather than keyword-guessing.
+            if (!string.IsNullOrWhiteSpace(data.ApplicationStatus) &&
+                !ApplicationStatuses.All.Contains(data.ApplicationStatus, StringComparer.OrdinalIgnoreCase))
             {
-                data.Position = ExtractPositionFromEmail(email);
-                data.Confidence = Math.Max(0, data.Confidence - 10);
-                _logger.LogInformation($"🔍 Fallback position extraction: '{data.Position}'");
+                data.ApplicationStatus = null;
             }
 
-            // 4. Validate status
-            var validStatuses = new[] { "Applied", "Interview Scheduled", "Rejected", "Offer", "In Progress" };
-            if (string.IsNullOrWhiteSpace(data.ApplicationStatus) ||
-                !validStatuses.Contains(data.ApplicationStatus, StringComparer.OrdinalIgnoreCase))
-            {
-                data.ApplicationStatus = DetectStatusFromEmail(email);
-                _logger.LogInformation($"🔍 Fallback status detection: '{data.ApplicationStatus}'");
-            }
-
-            // 5. Clean up company name
-            data.CompanyName = CleanCompanyName(data.CompanyName);
-
-            // 6. ALWAYS set description for AI-generated entries
             data.Description = "Automatically generated from your email via AI";
         }
 
@@ -540,6 +512,64 @@ CRITICAL RULES:
             };
         }
 
+        // System prompt: the classification taxonomy and extraction rules. The
+        // response shape itself is enforced by the JSON schema (structured outputs),
+        // so this focuses purely on *what* to extract and *how* to judge it.
+        private const string ExtractionSystemPrompt = @"You extract structured data from a SINGLE email for a job-application tracker. Be precise and never invent information.
+
+STEP 1 - Classify the email (emailType):
+- 'application_response': a direct response to a job the recipient personally applied to or is being considered for - application received/confirmation, interview invitation or scheduling, assessment/coding-challenge invite, rejection, offer, or a recruiter personally reaching out about a specific role for this person.
+- 'job_alert': automated job listings, recommendations, or digests ('jobs matching your search', 'N new jobs', 'jobs you may be interested in'). NOT an application.
+- 'newsletter': periodic content or updates not tied to the recipient's own application.
+- 'marketing_promotional': product promotions, upsells, webinars, sales, or advertising - including from job boards ('upgrade to Premium', 'boost your profile', 'complete your profile').
+- 'other': anything not job-application related.
+
+Only 'application_response' yields application data. For every other type, set all data fields to null and confidence to 0.
+
+STEP 2 - Extract (only for 'application_response'; otherwise null):
+- companyName: the EMPLOYER the person applied to. Use the company named in the body, subject, or signature/legal footer. If the email is from a recruiting agency, job board, or ATS (LinkedIn, Indeed, PNet, Greenhouse, Workday, Lever, SmartRecruiters, iCIMS, etc.) acting on behalf of a client, use the CLIENT company only if it is clearly named. NEVER use the job board / ATS / agency name, the email domain, or the sender's display name as the company unless it is unmistakably the actual employer. If you are not sure, return null - do not guess.
+- position: the exact job title applied for. If not stated, null.
+- applicationStatus: exactly one of 'Applied', 'In Progress', 'Interview Scheduled', 'Offer', 'Rejected', 'Accepted', 'Declined' - whichever the email conveys. If unclear, null.
+- recruiterName: the real human contact (an actual person's name) who sent or signed the email. Do NOT use team mailboxes, role labels ('Recruiting Team', 'Talent Acquisition'), automated senders ('no-reply'), ATS/platform names, or the company name. If no real person is identifiable, null.
+- recruiterEmail: that person's email address if present, otherwise null.
+- interviewDate: ISO-8601 datetime of a scheduled interview, otherwise null.
+- interviewType: 'phone', 'video', or 'onsite', otherwise null.
+- jobUrl: a direct link to the specific job posting, otherwise null.
+- salaryRange: stated compensation, otherwise null.
+- confidence: integer 0-100, your certainty in the extracted company + position + status (0 for any non-application type).";
+
+        // JSON schema for structured outputs. Nullable fields use a string|null type
+        // union; the model returns null when the value isn't present in the email.
+        private static object BuildExtractionSchema() => new
+        {
+            type = "object",
+            additionalProperties = false,
+            properties = new
+            {
+                emailType = new
+                {
+                    type = "string",
+                    @enum = new[] { "application_response", "job_alert", "newsletter", "marketing_promotional", "other" }
+                },
+                companyName = new { type = new[] { "string", "null" } },
+                position = new { type = new[] { "string", "null" } },
+                applicationStatus = new { type = new[] { "string", "null" } },
+                recruiterName = new { type = new[] { "string", "null" } },
+                recruiterEmail = new { type = new[] { "string", "null" } },
+                interviewDate = new { type = new[] { "string", "null" } },
+                interviewType = new { type = new[] { "string", "null" } },
+                jobUrl = new { type = new[] { "string", "null" } },
+                salaryRange = new { type = new[] { "string", "null" } },
+                confidence = new { type = "integer" }
+            },
+            required = new[]
+            {
+                "emailType", "companyName", "position", "applicationStatus",
+                "recruiterName", "recruiterEmail", "interviewDate", "interviewType",
+                "jobUrl", "salaryRange", "confidence"
+            }
+        };
+
         private string BuildPrompt(ProcessedEmail email)
         {
             var body = email.BodyPlainText ?? email.BodyHtml ?? email.Snippet ?? "";
@@ -552,58 +582,15 @@ CRITICAL RULES:
             if (body.Length > 4000)
                 body = body[..4000] + "...";
 
-            return $@"Analyze this email and determine if it's a legitimate job application response email.
+            return $@"Classify and extract from this email.
 
-CRITICAL CLASSIFICATION:
-1. IS a job application email:
-   - Application confirmation (""we received your application"")
-   - Interview invitation/scheduling
-   - Rejection notification
-   - Offer letter
-   - Application status update
-
-2. NOT a job application email:
-   - Job posting notifications/alerts (""new jobs matching your search"")
-   - Newsletter with job listings
-   - Marketing emails from job boards
-   - Weekly job digests
-   - ""Jobs you might be interested in""
-   - Promotional content
-
-If this is NOT a job application response, set isJobApplication=false and confidence=0.
-
-For VALID job applications:
-- Extract position from ""application for [POSITION]"" or ""applied to [POSITION]""
-- Extract company name from signature, footer, or metadata
-- If from recruitment platform (PNet, Indeed, LinkedIn, etc.) and no company specified, use platform name
-- For rejection emails (keywords: unfortunately, not proceeding, other candidates), set status to 'Rejected'
-
-Return ONLY valid JSON (no markdown, no explanation):
-
-{{
-  ""isJobApplication"": true/false,
-  ""companyName"": ""string or null"",
-  ""position"": ""string or null"",
-  ""applicationStatus"": ""Applied|Interview Scheduled|Rejected|Offer|In Progress"",
-  ""interviewDate"": ""ISO8601 string or null"",
-  ""recruiterName"": ""string or null"",
-  ""recruiterEmail"": ""string or null"",
-  ""jobUrl"": ""string or null"",
-  ""salaryRange"": ""string or null"",
-  ""interviewType"": ""phone|video|onsite or null"",
-  ""confidence"": 0-100
-}}
-
-EMAIL DETAILS:
 Subject: {email.Subject}
 From: {email.From}
-From Email: {email.FromEmail}
+From email: {email.FromEmail}
 Date: {email.Date:yyyy-MM-dd HH:mm}
 
-BODY:
-{body}
-
-JSON:";
+Body:
+{body}";
         }
 
         private string ExtractText(ClaudeApiResponse? response)
@@ -653,25 +640,6 @@ JSON:";
             html = Regex.Replace(html, "<[^>]+>", " ");
             html = Regex.Replace(html, @"\s+", " ");
             return html.Trim();
-        }
-
-        public bool ShouldAutoProcess(double confidence)
-        {
-            var threshold = double.Parse(Environment.GetEnvironmentVariable("AI_CONFIDENCE_THRESHOLD_AUTO") ?? "80");
-            return confidence >= threshold;
-        }
-
-        public bool RequiresReview(double confidence)
-        {
-            var auto = double.Parse(Environment.GetEnvironmentVariable("AI_CONFIDENCE_THRESHOLD_AUTO") ?? "80");
-            var review = double.Parse(Environment.GetEnvironmentVariable("AI_CONFIDENCE_THRESHOLD_REVIEW") ?? "50");
-
-            return confidence >= review && confidence < auto;
-        }
-
-        public void Dispose()
-        {
-            _httpClient?.Dispose();
         }
     }
 

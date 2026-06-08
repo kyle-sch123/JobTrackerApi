@@ -13,16 +13,18 @@ public class JobApplicationController : BaseController
     public JobApplicationController(JobApplicationService jobApplicationService) =>
         _jobApplicationService = jobApplicationService;
 
-    // GET: Get all job applications OR filter by userId query parameter
+    // GET: Get all job applications for the authenticated user
     [HttpGet]
     [Route("/api/jobapplications")]
     public async Task<ActionResult<List<JobApplication>>> GetAll()
     {
         var userId = GetUserId();
-        // If userId is provided, filter by user, otherwise return all
-        var jobApplications = string.IsNullOrEmpty(userId)
-            ? await _jobApplicationService.GetAsync()
-            : await _jobApplicationService.GetByUserAsync(userId);
+        if (string.IsNullOrEmpty(userId))
+        {
+            return Unauthorized(new { message = "User not authenticated" });
+        }
+
+        var jobApplications = await _jobApplicationService.GetByUserAsync(userId);
 
         return Ok(jobApplications);
     }
@@ -87,6 +89,10 @@ public class JobApplicationController : BaseController
     public async Task<IActionResult> Update(string id, [FromBody] JobApplication updatedJobApplication)
     {
         var userId = GetUserId();
+        if (string.IsNullOrEmpty(userId))
+        {
+            return Unauthorized(new { message = "User not authenticated" });
+        }
 
         // Validate model state
         if (!ModelState.IsValid)
@@ -99,6 +105,12 @@ public class JobApplicationController : BaseController
         if (existingJobApplication is null)
         {
             return NotFound(new { message = "Job application not found" });
+        }
+
+        // Verify the job application belongs to the user
+        if (existingJobApplication.userId != userId)
+        {
+            return Forbid();
         }
 
         // Preserve the original ID and userId
@@ -118,6 +130,12 @@ public class JobApplicationController : BaseController
     // [Route("/api/jobapplication/{id:length(24)}")] // Match singular route
     public async Task<IActionResult> Delete(string id)
     {
+        var userId = GetUserId();
+        if (string.IsNullOrEmpty(userId))
+        {
+            return Unauthorized(new { message = "User not authenticated" });
+        }
+
         var jobApplication = await _jobApplicationService.GetAsync(id);
 
         if (jobApplication is null)
@@ -125,21 +143,34 @@ public class JobApplicationController : BaseController
             return NotFound(new { message = "Job application not found" });
         }
 
+        // Verify the job application belongs to the user
+        if (jobApplication.userId != userId)
+        {
+            return Forbid();
+        }
+
         await _jobApplicationService.RemoveAsync(id);
 
         return Ok(new { message = "Job application deleted successfully" });
     }
 
-    // DELETE: Delete all job applications for a user
+    // DELETE: Delete all job applications for the authenticated user
     [HttpDelete("user/{userId}")]
     public async Task<IActionResult> DeleteAllForUser(string userId)
     {
-        if (string.IsNullOrEmpty(userId))
+        var callerId = GetUserId();
+        if (string.IsNullOrEmpty(callerId))
         {
-            return BadRequest(new { message = "User ID is required" });
+            return Unauthorized(new { message = "User not authenticated" });
         }
 
-        var deletedCount = await _jobApplicationService.RemoveAllForUserAsync(userId);
+        // A user may only bulk-delete their own applications
+        if (userId != callerId)
+        {
+            return Forbid();
+        }
+
+        var deletedCount = await _jobApplicationService.RemoveAllForUserAsync(callerId);
 
         return Ok(new
         {
@@ -152,11 +183,23 @@ public class JobApplicationController : BaseController
     [HttpPatch("{id:length(24)}/status")]
     public async Task<IActionResult> UpdateStatus(string id, [FromBody] StatusUpdateRequest request)
     {
+        var userId = GetUserId();
+        if (string.IsNullOrEmpty(userId))
+        {
+            return Unauthorized(new { message = "User not authenticated" });
+        }
+
         var jobApplication = await _jobApplicationService.GetAsync(id);
 
         if (jobApplication is null)
         {
             return NotFound(new { message = "Job application not found" });
+        }
+
+        // Verify the job application belongs to the user
+        if (jobApplication.userId != userId)
+        {
+            return Forbid();
         }
 
         jobApplication.status = request.Status;

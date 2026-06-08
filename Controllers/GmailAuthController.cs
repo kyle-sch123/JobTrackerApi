@@ -1,6 +1,7 @@
 using JobTrackerApi.Services;
 using System.Text.Json;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Caching.Memory;
 
 namespace JobTrackerApi.Controllers
 {
@@ -8,18 +9,23 @@ namespace JobTrackerApi.Controllers
     [Route("api/auth/gmail")]
     public class GmailAuthController : BaseController
     {
+        private const string StateCachePrefix = "gmail_oauth_state:";
+
         private readonly GmailAuthService _authService;
         private readonly ILogger<GmailAuthController> _logger;
         private readonly IConfiguration _configuration;
+        private readonly IMemoryCache _cache;
 
         public GmailAuthController(
             GmailAuthService authService,
             ILogger<GmailAuthController> logger,
-            IConfiguration configuration)
+            IConfiguration configuration,
+            IMemoryCache cache)
         {
             _authService = authService;
             _logger = logger;
             _configuration = configuration;
+            _cache = cache;
         }
 
         // GET: api/auth/gmail/connect
@@ -35,14 +41,13 @@ namespace JobTrackerApi.Controllers
                     return Unauthorized(new { error = "User not authenticated" });
                 }
                 
-                // Generate a state token for CSRF protection
+                // Generate a state token for CSRF protection and stash state→userId
+                // so the callback can verify the round-trip (10-minute window).
                 var state = Convert.ToBase64String(Guid.NewGuid().ToByteArray());
-                
-                // Store state in a way that can be verified later (you might want to use Redis or similar)
-                // For now, we'll just pass it through and verify the userId in callback
-                
+                _cache.Set(StateCachePrefix + state, userId, TimeSpan.FromMinutes(10));
+
                 var authUrl = _authService.GetAuthorizationUrl(userId, state);
-                
+
                 return Ok(new { authUrl, state });
             }
             catch (Exception ex)
@@ -64,28 +69,30 @@ namespace JobTrackerApi.Controllers
                     return BadRequest(new { error = "Authorization code is required" });
                 }
 
-                // In production, verify the state token here for CSRF protection
-                
-                // Try to get userId from query first (frontend may pass it), otherwise decode it from state
-                var userId = Request.Query["userId"].ToString();
+                // state is Base64(JSON { userId, state }) as produced by GetAuthorizationUrl.
+                // Decode both the embedded userId and the inner CSRF state token.
+                string? decodedUserId = null;
+                string? innerState = null;
+                try
+                {
+                    var decoded = System.Text.Encoding.UTF8.GetString(Convert.FromBase64String(state ?? ""));
+                    var doc = JsonSerializer.Deserialize<JsonElement>(decoded);
+                    if (doc.ValueKind == JsonValueKind.Object)
+                    {
+                        if (doc.TryGetProperty("userId", out var uidProp)) decodedUserId = uidProp.GetString();
+                        if (doc.TryGetProperty("state", out var stateProp)) innerState = stateProp.GetString();
+                    }
+                }
+                catch
+                {
+                    // ignore decoding errors and fall through to validation
+                }
 
+                // Prefer userId from query (frontend may pass it), else from state.
+                var userId = Request.Query["userId"].ToString();
                 if (string.IsNullOrEmpty(userId))
                 {
-                    try
-                    {
-                        // state is Base64(JSON { userId, state }) as produced by GetAuthorizationUrl
-                        var stateBase64 = state ?? "";
-                        var decoded = System.Text.Encoding.UTF8.GetString(Convert.FromBase64String(stateBase64));
-                        var doc = System.Text.Json.JsonSerializer.Deserialize<JsonElement>(decoded);
-                        if (doc.ValueKind == System.Text.Json.JsonValueKind.Object && doc.TryGetProperty("userId", out var uidProp))
-                        {
-                            userId = uidProp.GetString();
-                        }
-                    }
-                    catch
-                    {
-                        // ignore decoding errors and fall through to validation
-                    }
+                    userId = decodedUserId;
                 }
 
                 if (string.IsNullOrEmpty(userId))
@@ -93,28 +100,38 @@ namespace JobTrackerApi.Controllers
                     return BadRequest(new { error = "User ID is required" });
                 }
 
+                // CSRF: the inner state must match the value we stashed during Connect
+                // and be bound to this same user.
+                if (string.IsNullOrEmpty(innerState) ||
+                    !_cache.TryGetValue(StateCachePrefix + innerState, out string? expectedUserId) ||
+                    expectedUserId != userId)
+                {
+                    _logger.LogWarning("OAuth state verification failed for user {UserId}", userId);
+
+                    var feUrl = GetFrontendUrl();
+                    return Redirect($"{feUrl}/settings?gmail=error");
+                }
+
+                _cache.Remove(StateCachePrefix + innerState);
+
                 var connection = await _authService.ExchangeCodeForTokensAsync(code, userId);
 
-                // Get frontend URL for redirect
-                var isDevelopment = Environment.GetEnvironmentVariable("ASPNETCORE_ENVIRONMENT") == "Development";
-                var frontendUrl = isDevelopment
-                    ? Environment.GetEnvironmentVariable("FRONTEND_URL_DEV")
-                    : Environment.GetEnvironmentVariable("FRONTEND_URL_PROD");
-
                 // Redirect back to frontend with success
-                return Redirect($"{frontendUrl}/settings?gmail=connected");
+                return Redirect($"{GetFrontendUrl()}/settings?gmail=connected");
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Failed to handle Gmail OAuth callback");
-                
-                var isDevelopment = Environment.GetEnvironmentVariable("ASPNETCORE_ENVIRONMENT") == "Development";
-                var frontendUrl = isDevelopment
-                    ? Environment.GetEnvironmentVariable("FRONTEND_URL_DEV")
-                    : Environment.GetEnvironmentVariable("FRONTEND_URL_PROD");
-
-                return Redirect($"{frontendUrl}/settings?gmail=error");
+                return Redirect($"{GetFrontendUrl()}/settings?gmail=error");
             }
+        }
+
+        private static string? GetFrontendUrl()
+        {
+            var isDevelopment = Environment.GetEnvironmentVariable("ASPNETCORE_ENVIRONMENT") == "Development";
+            return isDevelopment
+                ? Environment.GetEnvironmentVariable("FRONTEND_URL_DEV")
+                : Environment.GetEnvironmentVariable("FRONTEND_URL_PROD");
         }
 
         // GET: api/auth/gmail/status

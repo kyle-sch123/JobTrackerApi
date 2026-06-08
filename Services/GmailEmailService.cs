@@ -14,6 +14,7 @@ namespace JobTrackerApi.Services
     {
         private readonly IMongoCollection<ProcessedEmail> _processedEmailCollection;
         private readonly GmailAuthService _authService;
+        private readonly JobRelatedEmailFilter _jobFilter;
         private readonly ILogger<GmailEmailService> _logger;
 
         // Common job-related keywords and domains
@@ -34,9 +35,11 @@ namespace JobTrackerApi.Services
         public GmailEmailService(
             IOptions<JobApplicationDatabaseSettings> dbSettings,
             GmailAuthService authService,
+            JobRelatedEmailFilter jobFilter,
             ILogger<GmailEmailService> logger)
         {
             _authService = authService;
+            _jobFilter = jobFilter;
             _logger = logger;
 
             var settings = dbSettings.Value;
@@ -137,10 +140,7 @@ namespace JobTrackerApi.Services
             // Extract body
             var (plainText, html) = ExtractEmailBody(message.Payload);
 
-            // Determine if job-related
-            var isJobRelated = IsJobRelatedEmail(subject, from, plainText ?? html ?? "");
-
-            return new ProcessedEmail
+            var email = new ProcessedEmail
             {
                 UserId = userId,
                 GmailMessageId = message.Id,
@@ -154,10 +154,15 @@ namespace JobTrackerApi.Services
                 BodyPlainText = plainText,
                 BodyHtml = html,
                 Labels = message.LabelIds?.ToList() ?? new List<string>(),
-                IsJobRelated = isJobRelated,
                 ProcessedAt = DateTime.UtcNow,
                 ProcessingStatus = "pending"
             };
+
+            // Use the canonical filter so the fetch-time flag agrees with the
+            // processing pipeline (which also uses JobRelatedEmailFilter).
+            email.IsJobRelated = _jobFilter.IsJobRelated(email);
+
+            return email;
         }
 
         // Extract email body (plain text and HTML)
@@ -220,21 +225,6 @@ namespace JobTrackerApi.Services
             }
         }
 
-        // Check if email is job-related
-        private bool IsJobRelatedEmail(string subject, string from, string body)
-        {
-            var content = $"{subject} {from} {body}".ToLower();
-
-            // Check for job-related keywords
-            var hasKeyword = JobKeywords.Any(keyword => content.Contains(keyword));
-
-            // Check for job board domains
-            var fromDomain = ExtractDomain(from);
-            var isFromJobBoard = JobBoardDomains.Any(domain => fromDomain.Contains(domain));
-
-            return hasKeyword || isFromJobBoard;
-        }
-
         // Build Gmail search query
         private string BuildSearchQuery(DateTime? since)
         {
@@ -274,13 +264,6 @@ namespace JobTrackerApi.Services
         {
             var match = Regex.Match(from, @"<(.+?)>|^([^\s<>]+@[^\s<>]+)$");
             return match.Success ? (match.Groups[1].Value.Length > 0 ? match.Groups[1].Value : match.Groups[2].Value) : from;
-        }
-
-        private string ExtractDomain(string email)
-        {
-            var emailAddress = ExtractEmailAddress(email);
-            var atIndex = emailAddress.LastIndexOf('@');
-            return atIndex > 0 ? emailAddress.Substring(atIndex + 1).ToLower() : "";
         }
 
         private GmailService CreateGmailService(string accessToken)

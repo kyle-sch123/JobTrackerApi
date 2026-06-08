@@ -1,5 +1,7 @@
+using System.Text.RegularExpressions;
 using JobTrackerApi.Models;
 using Microsoft.Extensions.Options;
+using MongoDB.Bson;
 using MongoDB.Driver;
 
 namespace JobTrackerApi.Services
@@ -73,26 +75,20 @@ namespace JobTrackerApi.Services
             var companyVariations = GenerateCompanyVariations(extractedData.CompanyName ?? "");
             var positionVariations = GeneratePositionVariations(extractedData.Position ?? "");
 
-            // Find applications with matching company and similar position
-            var applications = await _jobApplicationCollection
-                .Find(x => x.userId == userId)
-                .ToListAsync();
+            // Narrow the query to candidates whose current OR original company
+            // matches a variation, rather than loading the user's whole history.
+            var filter = BuildUserCompanyFilter(userId, companyVariations);
+            var applications = await _jobApplicationCollection.Find(filter).ToListAsync();
 
+            // Company already matched in the query; only the position needs checking.
             return applications.FirstOrDefault(app =>
-                // Match against current company name OR original (AI-extracted) company name
-                (companyVariations.Any(variation =>
-                    app.company.Equals(variation, StringComparison.OrdinalIgnoreCase)) ||
-                 (!string.IsNullOrEmpty(app.OriginalCompany) &&
-                  companyVariations.Any(variation =>
-                    app.OriginalCompany.Equals(variation, StringComparison.OrdinalIgnoreCase)))) &&
-                // Match against current position OR original (AI-extracted) position
-                (positionVariations.Any(variation =>
+                positionVariations.Any(variation =>
                     app.jobTitle.Contains(variation, StringComparison.OrdinalIgnoreCase) ||
                     variation.Contains(app.jobTitle, StringComparison.OrdinalIgnoreCase)) ||
-                 (!string.IsNullOrEmpty(app.OriginalPosition) &&
-                  positionVariations.Any(variation =>
+                (!string.IsNullOrEmpty(app.OriginalPosition) &&
+                 positionVariations.Any(variation =>
                     app.OriginalPosition.Contains(variation, StringComparison.OrdinalIgnoreCase) ||
-                    variation.Contains(app.OriginalPosition, StringComparison.OrdinalIgnoreCase))))
+                    variation.Contains(app.OriginalPosition, StringComparison.OrdinalIgnoreCase)))
             );
         }
 
@@ -102,22 +98,50 @@ namespace JobTrackerApi.Services
         {
             var companyVariations = GenerateCompanyVariations(extractedData.CompanyName ?? "");
 
-            // Find most recent application to this company (within last 90 days)
+            // Most recent application to this company within the last 90 days.
             var cutoffDate = DateTime.UtcNow.AddDays(-90);
 
+            var filter = BuildUserCompanyFilter(userId, companyVariations, cutoffDate);
             var applications = await _jobApplicationCollection
-                .Find(x => x.userId == userId && x.applicationDate >= cutoffDate)
+                .Find(filter)
                 .SortByDescending(x => x.applicationDate)
                 .ToListAsync();
 
-            return applications.FirstOrDefault(app =>
-                // Match against current company name OR original (AI-extracted) company name
-                companyVariations.Any(variation =>
-                    app.company.Equals(variation, StringComparison.OrdinalIgnoreCase)) ||
-                (!string.IsNullOrEmpty(app.OriginalCompany) &&
-                 companyVariations.Any(variation =>
-                    app.OriginalCompany.Equals(variation, StringComparison.OrdinalIgnoreCase)))
-            );
+            return applications.FirstOrDefault();
+        }
+
+        // Builds a Mongo filter: userId AND (company OR originalCompany matches any
+        // variation, case-insensitive exact), optionally constrained to a date.
+        private static FilterDefinition<JobApplication> BuildUserCompanyFilter(
+            string userId,
+            List<string> companyVariations,
+            DateTime? since = null)
+        {
+            var f = Builders<JobApplication>.Filter;
+
+            var companyClauses = new List<FilterDefinition<JobApplication>>();
+            foreach (var variation in companyVariations)
+            {
+                if (string.IsNullOrWhiteSpace(variation)) continue;
+
+                var rx = new BsonRegularExpression($"^{Regex.Escape(variation)}$", "i");
+                companyClauses.Add(f.Regex(x => x.company, rx));
+                companyClauses.Add(f.Regex(x => x.OriginalCompany, rx));
+            }
+
+            var filter = f.Eq(x => x.userId, userId);
+
+            if (companyClauses.Count > 0)
+            {
+                filter = f.And(filter, f.Or(companyClauses));
+            }
+
+            if (since.HasValue)
+            {
+                filter = f.And(filter, f.Gte(x => x.applicationDate, since.Value));
+            }
+
+            return filter;
         }
 
         private List<string> GenerateCompanyVariations(string companyName)

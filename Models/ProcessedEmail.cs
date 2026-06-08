@@ -102,6 +102,9 @@ namespace JobTrackerApi.Models
         [BsonElement("extractionMethod")]
         public string ExtractionMethod { get; set; } = "unknown";
 
+        [BsonElement("emailType")]
+        public string? EmailType { get; set; } // application_response | job_alert | newsletter | marketing_promotional | other
+
         public bool IsJobApplication { get; set; } = true;
         public string? Description { get; set; }
     }

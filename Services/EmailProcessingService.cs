@@ -1,5 +1,6 @@
 using JobTrackerApi.Models;
 using Microsoft.Extensions.Options;
+using MongoDB.Bson;
 using MongoDB.Driver;
 
 namespace JobTrackerApi.Services
@@ -348,21 +349,10 @@ namespace JobTrackerApi.Services
         {
             if (string.IsNullOrEmpty(newStatus)) return false;
 
-            var statusHierarchy = new Dictionary<string, int>
-            {
-                { "Applied", 1 },
-                { "In Progress", 2 },
-                { "Interview Scheduled", 3 },
-                { "Offer", 4 },
-                { "Rejected", 5 },
-                { "Accepted", 6 },
-                { "Declined", 6 }
-            };
+            var currentLevel = ApplicationStatuses.Hierarchy.GetValueOrDefault(currentStatus, 0);
+            var newLevel = ApplicationStatuses.Hierarchy.GetValueOrDefault(newStatus, 0);
 
-            var currentLevel = statusHierarchy.GetValueOrDefault(currentStatus, 0);
-            var newLevel = statusHierarchy.GetValueOrDefault(newStatus, 0);
-
-            return newStatus == "Rejected" || newLevel > currentLevel;
+            return newStatus == ApplicationStatuses.Rejected || newLevel > currentLevel;
         }
 
         public async Task<List<ProcessingResult>> ProcessPendingEmailsAsync(string userId)
@@ -425,37 +415,74 @@ namespace JobTrackerApi.Services
 
         public async Task<object> GetProcessingStatsAsync(string userId)
         {
-            var allEmails = await _processedEmailCollection
-                .Find(e => e.UserId == userId)
-                .ToListAsync();
+            // Count server-side instead of loading the whole collection into memory.
+            var f = Builders<ProcessedEmail>.Filter;
+            var userFilter = f.Eq(e => e.UserId, userId);
+            var jobRelated = f.And(userFilter, f.Eq(e => e.IsJobRelated, true));
 
-            var jobRelatedEmails = allEmails.Where(e => e.IsJobRelated).ToList();
+            FilterDefinition<ProcessedEmail> WithJobRelated(FilterDefinition<ProcessedEmail> extra) =>
+                f.And(jobRelated, extra);
+
+            // The driver's connection pool is thread-safe, so issue the counts concurrently.
+            var totalEmailsT = _processedEmailCollection.CountDocumentsAsync(userFilter);
+            var jobRelatedT = _processedEmailCollection.CountDocumentsAsync(jobRelated);
+            var aiParsedT = _processedEmailCollection.CountDocumentsAsync(WithJobRelated(f.Eq(e => e.AiParsed, true)));
+            var pendingT = _processedEmailCollection.CountDocumentsAsync(WithJobRelated(f.Eq(e => e.ProcessingStatus, "pending")));
+            var processedT = _processedEmailCollection.CountDocumentsAsync(WithJobRelated(f.Eq(e => e.ProcessingStatus, "processed")));
+            var requiresReviewT = _processedEmailCollection.CountDocumentsAsync(WithJobRelated(f.Eq(e => e.ProcessingStatus, "requires_review")));
+            var ignoredT = _processedEmailCollection.CountDocumentsAsync(WithJobRelated(f.Eq(e => e.ProcessingStatus, "ignored")));
+            var failedT = _processedEmailCollection.CountDocumentsAsync(WithJobRelated(f.Eq(e => e.ProcessingStatus, "failed")));
+
+            var highConfT = _processedEmailCollection.CountDocumentsAsync(WithJobRelated(f.Gte("extractedData.confidence", 70.0)));
+            var medConfT = _processedEmailCollection.CountDocumentsAsync(WithJobRelated(f.And(f.Gte("extractedData.confidence", 40.0), f.Lt("extractedData.confidence", 70.0))));
+            var lowConfT = _processedEmailCollection.CountDocumentsAsync(WithJobRelated(f.And(f.Exists("extractedData.confidence"), f.Lt("extractedData.confidence", 40.0))));
+
+            var ruleBasedT = _processedEmailCollection.CountDocumentsAsync(WithJobRelated(f.Eq(e => e.ExtractionMethod, "rule-based")));
+            var hybridRefinedT = _processedEmailCollection.CountDocumentsAsync(WithJobRelated(f.Eq(e => e.ExtractionMethod, "hybrid-refined")));
+            var llmFullT = _processedEmailCollection.CountDocumentsAsync(WithJobRelated(f.Eq(e => e.ExtractionMethod, "llm-full")));
+
+            await Task.WhenAll(
+                totalEmailsT, jobRelatedT, aiParsedT, pendingT, processedT, requiresReviewT,
+                ignoredT, failedT, highConfT, medConfT, lowConfT, ruleBasedT, hybridRefinedT, llmFullT);
+
+            // Average confidence over job-related emails that have extracted data.
+            var avgAgg = await _processedEmailCollection.Aggregate()
+                .Match(jobRelated)
+                .Group(new BsonDocument
+                {
+                    { "_id", BsonNull.Value },
+                    { "avg", new BsonDocument("$avg", "$extractedData.confidence") }
+                })
+                .FirstOrDefaultAsync();
+
+            double averageConfidence = 0;
+            if (avgAgg != null && avgAgg.Contains("avg") && !avgAgg["avg"].IsBsonNull)
+            {
+                averageConfidence = avgAgg["avg"].ToDouble();
+            }
 
             return new
             {
-                totalEmails = allEmails.Count,
-                jobRelatedEmails = jobRelatedEmails.Count,
-                aiParsed = jobRelatedEmails.Count(e => e.AiParsed),
-                pending = jobRelatedEmails.Count(e => e.ProcessingStatus == "pending"),
-                processed = jobRelatedEmails.Count(e => e.ProcessingStatus == "processed"),
-                requiresReview = jobRelatedEmails.Count(e => e.ProcessingStatus == "requires_review"),
-                ignored = jobRelatedEmails.Count(e => e.ProcessingStatus == "ignored"),
-                failed = jobRelatedEmails.Count(e => e.ProcessingStatus == "failed"),
-                averageConfidence = jobRelatedEmails.Where(e => e.ExtractedData != null)
-                    .Select(e => e.ExtractedData!.Confidence)
-                    .DefaultIfEmpty(0)
-                    .Average(),
+                totalEmails = totalEmailsT.Result,
+                jobRelatedEmails = jobRelatedT.Result,
+                aiParsed = aiParsedT.Result,
+                pending = pendingT.Result,
+                processed = processedT.Result,
+                requiresReview = requiresReviewT.Result,
+                ignored = ignoredT.Result,
+                failed = failedT.Result,
+                averageConfidence,
                 breakdown = new
                 {
-                    highConfidence = jobRelatedEmails.Count(e => e.ExtractedData != null && e.ExtractedData.Confidence >= 70),
-                    mediumConfidence = jobRelatedEmails.Count(e => e.ExtractedData != null && e.ExtractedData.Confidence >= 40 && e.ExtractedData.Confidence < 70),
-                    lowConfidence = jobRelatedEmails.Count(e => e.ExtractedData != null && e.ExtractedData.Confidence < 40)
+                    highConfidence = highConfT.Result,
+                    mediumConfidence = medConfT.Result,
+                    lowConfidence = lowConfT.Result
                 },
                 extractionMethods = new
                 {
-                    ruleBased = jobRelatedEmails.Count(e => e.ExtractionMethod == "rule-based"),
-                    hybridRefined = jobRelatedEmails.Count(e => e.ExtractionMethod == "hybrid-refined"),
-                    llmFull = jobRelatedEmails.Count(e => e.ExtractionMethod == "llm-full")
+                    ruleBased = ruleBasedT.Result,
+                    hybridRefined = hybridRefinedT.Result,
+                    llmFull = llmFullT.Result
                 }
             };
         }

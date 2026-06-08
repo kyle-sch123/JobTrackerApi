@@ -12,7 +12,6 @@ using Hangfire.Mongo.Migration.Strategies.Backup;
 
 using JobTrackerApi.Jobs; // for BackgroundEmailSyncJob
 using JobTrackerApi.Middleware;
-using Hangfire.Dashboard;
 using MongoDB.Driver; // for UseFirebaseAuth middleware
 
 //Loading da environment vars first
@@ -55,9 +54,16 @@ builder.Configuration["JobApplicationDatabase:ProcessedEmailCollectionName"] = p
 // Initialize Firebase Admin SDK safely
 if (firebaseConfigured)
 {
-    var cleanedPrivateKey = firebasePrivateKey
-        .Replace("\\n", "\n")
-        .Replace("\"", "");
+    var cleanedPrivateKey = firebasePrivateKey.Replace("\\n", "\n");
+
+    // Trim a single pair of surrounding quotes if the env value was quoted.
+    // (The old code stripped EVERY quote, which silently corrupts any key whose
+    // value wasn't wrapped in quotes.)
+    if (cleanedPrivateKey.Length >= 2 &&
+        cleanedPrivateKey.StartsWith("\"") && cleanedPrivateKey.EndsWith("\""))
+    {
+        cleanedPrivateKey = cleanedPrivateKey[1..^1];
+    }
 
     var json = $@"{{
         ""type"": ""service_account"",
@@ -87,6 +93,31 @@ if (firebaseConfigured)
 builder.Services.Configure<JobApplicationDatabaseSettings>(builder.Configuration.GetSection("JobApplicationDatabase"));
 
 builder.Services.AddControllers().AddJsonOptions(options => options.JsonSerializerOptions.PropertyNamingPolicy = null);
+
+// IHttpClientFactory for pooled HttpClient instances (avoids socket exhaustion)
+builder.Services.AddHttpClient();
+
+// Named client for the Anthropic Messages API, pre-configured with auth headers.
+builder.Services.AddHttpClient("claude", client =>
+{
+    var claudeApiKey = Environment.GetEnvironmentVariable("CLAUDE_API_KEY");
+    if (!string.IsNullOrEmpty(claudeApiKey))
+    {
+        client.DefaultRequestHeaders.Add("x-api-key", claudeApiKey);
+    }
+    client.DefaultRequestHeaders.Add("anthropic-version", "2023-06-01");
+});
+
+// Centralised confidence thresholds, bound once from env and injected everywhere
+// instead of each service re-reading environment variables on every call.
+var autoThreshold = double.Parse(Environment.GetEnvironmentVariable("AI_CONFIDENCE_THRESHOLD_AUTO") ?? "70");
+var reviewThreshold = double.Parse(Environment.GetEnvironmentVariable("AI_CONFIDENCE_THRESHOLD_REVIEW") ?? "40");
+builder.Services.AddSingleton(new ConfidenceThresholds { Auto = autoThreshold, Review = reviewThreshold });
+
+// Data protection (encrypts Gmail OAuth tokens at rest) and an in-memory cache
+// (holds OAuth state tokens for CSRF verification during the consent flow).
+builder.Services.AddDataProtection();
+builder.Services.AddMemoryCache();
 
 //Existing Services
 builder.Services.AddSingleton<JobApplicationService>();
@@ -138,15 +169,42 @@ builder.Services.AddHangfireServer(options =>
 // Learn more about configuring OpenAPI at https://aka.ms/aspnet/openapi
 builder.Services.AddOpenApi();
 
-builder.WebHost.UseUrls("http://0.0.0.0:5000");
+// Bind to ASPNETCORE_URLS when provided (e.g. the container sets http://+:8080),
+// otherwise fall back to the local-dev default.
+var aspnetUrls = Environment.GetEnvironmentVariable("ASPNETCORE_URLS");
+builder.WebHost.UseUrls(
+    !string.IsNullOrWhiteSpace(aspnetUrls) ? aspnetUrls : "http://0.0.0.0:5000"
+);
+
+// Restrict CORS to the configured frontend origins. Falls back to AllowAnyOrigin
+// only when no origins are configured (local dev convenience).
+var allowedOrigins = new[]
+{
+    Environment.GetEnvironmentVariable("FRONTEND_URL_DEV"),
+    Environment.GetEnvironmentVariable("FRONTEND_URL_PROD")
+}
+.Where(o => !string.IsNullOrWhiteSpace(o))
+.Select(o => o!)
+.ToArray();
 
 builder.Services.AddCors(options =>
 {
-    options.AddPolicy("AllowAll",
-        policy => policy
-            .AllowAnyOrigin()
-            .AllowAnyMethod()
-            .AllowAnyHeader());
+    options.AddPolicy("AllowFrontend", policy =>
+    {
+        if (allowedOrigins.Length > 0)
+        {
+            policy.WithOrigins(allowedOrigins)
+                  .AllowAnyMethod()
+                  .AllowAnyHeader()
+                  .AllowCredentials();
+        }
+        else
+        {
+            policy.AllowAnyOrigin()
+                  .AllowAnyMethod()
+                  .AllowAnyHeader();
+        }
+    });
 });
 
 var app = builder.Build();
@@ -172,13 +230,57 @@ if (app.Environment.IsDevelopment())
 
 // app.UseHttpsRedirection();
 
-app.UseCors("AllowAll");
+app.UseCors("AllowFrontend");
 
 app.UseFirebaseAuth();
 
 app.UseAuthorization();
 
 app.MapControllers();
+
+// Ensure MongoDB indexes exist for the hot query paths (idempotent; safe to run
+// every startup). Without these, lookups by (user, message id) / (user, status)
+// fall back to full collection scans.
+try
+{
+    var indexClient = new MongoClient(connectionString);
+    var indexDb = indexClient.GetDatabase(databaseName);
+
+    var processedEmails = indexDb.GetCollection<ProcessedEmail>(processedEmailCollectionName);
+    await processedEmails.Indexes.CreateManyAsync(new[]
+    {
+        new CreateIndexModel<ProcessedEmail>(
+            Builders<ProcessedEmail>.IndexKeys
+                .Ascending(e => e.UserId)
+                .Ascending(e => e.GmailMessageId),
+            new CreateIndexOptions { Unique = true, Name = "ux_user_gmailMessageId" }),
+        new CreateIndexModel<ProcessedEmail>(
+            Builders<ProcessedEmail>.IndexKeys
+                .Ascending(e => e.UserId)
+                .Ascending(e => e.ProcessingStatus),
+            new CreateIndexOptions { Name = "ix_user_processingStatus" })
+    });
+
+    var connections = indexDb.GetCollection<UserEmailConnection>(userEmailConnectionCollectionName);
+    await connections.Indexes.CreateOneAsync(
+        new CreateIndexModel<UserEmailConnection>(
+            Builders<UserEmailConnection>.IndexKeys
+                .Ascending(c => c.UserId)
+                .Ascending(c => c.IsActive),
+            new CreateIndexOptions { Name = "ix_user_isActive" }));
+
+    var jobApplications = indexDb.GetCollection<JobApplication>(jobCollectionName);
+    await jobApplications.Indexes.CreateOneAsync(
+        new CreateIndexModel<JobApplication>(
+            Builders<JobApplication>.IndexKeys.Ascending(j => j.userId),
+            new CreateIndexOptions { Name = "ix_userId" }));
+
+    app.Logger.LogInformation("MongoDB indexes ensured.");
+}
+catch (Exception ex)
+{
+    app.Logger.LogWarning(ex, "Failed to ensure MongoDB indexes (continuing startup).");
+}
 
 var syncIntervalMinutes = int.Parse(
     Environment.GetEnvironmentVariable("EMAIL_SYNC_INTERVAL_MINUTES") ?? "15"
@@ -194,39 +296,3 @@ recurringJobManager.AddOrUpdate<BackgroundEmailSyncJob>(
 );
 
 app.Run();
-
-// Basic Hangfire dashboard authorization filter
-public class HangfireAuthorizationFilter : Hangfire.Dashboard.IDashboardAuthorizationFilter
-{
-    private readonly string _username;
-    private readonly string _password;
-
-    public HangfireAuthorizationFilter(string username, string password)
-    {
-        _username = username;
-        _password = password;
-    }
-
-    public bool Authorize(Hangfire.Dashboard.DashboardContext context)
-    {
-        var httpContext = context.GetHttpContext();
-        var authHeader = httpContext.Request.Headers["Authorization"].FirstOrDefault();
-
-        if (authHeader != null && authHeader.StartsWith("Basic "))
-        {
-            var encodedCredentials = authHeader.Substring("Basic ".Length).Trim();
-            var credentials = System.Text.Encoding.UTF8.GetString(
-                Convert.FromBase64String(encodedCredentials)
-            ).Split(':');
-
-            var username = credentials[0];
-            var password = credentials[1];
-
-            return username == _username && password == _password;
-        }
-
-        httpContext.Response.Headers["WWW-Authenticate"] = "Basic realm=\"Hangfire Dashboard\"";
-        httpContext.Response.StatusCode = 401;
-        return false;
-    }
-}
