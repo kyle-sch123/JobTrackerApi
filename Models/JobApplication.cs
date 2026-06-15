@@ -61,6 +61,9 @@ public class JobApplication
     [BsonElement("emailIds")]
     public List<string>? EmailIds { get; set; } // Links to ProcessedEmail IDs
 
+    [BsonElement("threadIds")]
+    public List<string>? ThreadIds { get; set; } // Gmail thread IDs linked to this app (dedup signal)
+
     [BsonElement("autoCreated")]
     public bool AutoCreated { get; set; } = false; // Was this created by AI?
 
