@@ -164,7 +164,7 @@ namespace JobTrackerApi.Services
         {
             // Step 1: Check if matching application exists
             var existingApp = await _matchingService.FindMatchingApplicationAsync(
-                email.UserId,
+                email,
                 extractedData
             );
 
@@ -289,6 +289,9 @@ namespace JobTrackerApi.Services
                 AiConfidence = extractedData.Confidence,
                 RequiresReview = extractedData.Confidence < 70,
                 EmailIds = new List<string> { email.Id! },
+                ThreadIds = string.IsNullOrEmpty(email.ThreadId)
+                    ? new List<string>()
+                    : new List<string> { email.ThreadId },
                 CreatedAt = DateTime.UtcNow,
                 UpdatedAt = DateTime.UtcNow
             };
@@ -332,6 +335,15 @@ namespace JobTrackerApi.Services
             if (!app.EmailIds.Contains(email.Id!))
             {
                 app.EmailIds.Add(email.Id!);
+            }
+
+            if (!string.IsNullOrEmpty(email.ThreadId))
+            {
+                app.ThreadIds ??= new List<string>();
+                if (!app.ThreadIds.Contains(email.ThreadId))
+                {
+                    app.ThreadIds.Add(email.ThreadId);
+                }
             }
 
             app.UpdatedAt = DateTime.UtcNow;
