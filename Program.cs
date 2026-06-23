@@ -238,6 +238,14 @@ app.UseAuthorization();
 
 app.MapControllers();
 
+// Lightweight, unauthenticated liveness probe for the load balancer / uptime
+// checks. Auth is skipped for "/health*" in FirebaseAuthMiddleware.
+app.MapGet("/healthz", () => Results.Ok(new
+{
+    status = "ok",
+    timestamp = DateTime.UtcNow
+}));
+
 // Ensure MongoDB indexes exist for the hot query paths (idempotent; safe to run
 // every startup). Without these, lookups by (user, message id) / (user, status)
 // fall back to full collection scans.
