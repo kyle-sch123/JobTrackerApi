@@ -224,33 +224,59 @@ namespace JobTrackerApi.Services
                 }
             }
 
-            // LinkedIn specific alerts
+            // LinkedIn non-application emails. LinkedIn itself only ever sends job
+            // alerts, social/feed notifications, and network digests — never an actual
+            // application response (those come from the employer/ATS). Real recruiter
+            // outreach is InMail/messaging, which these patterns deliberately avoid.
             if (fromEmail.Contains("linkedin"))
             {
-                var linkedInAlertPatterns = new[]
+                var linkedInNonApplicationPatterns = new[]
                 {
+                    // Job alerts / postings
                     @"jobs? you may be interested in",
                     @"jobs? for you",
                     @"\d+ new jobs?",
                     @"jobs? in .+ are hiring",
-                    @"your job alert for"
+                    @"your job alert for",
+
+                    // Social / feed activity (the "share their thoughts" digest, etc.)
+                    @"shared? (?:a|an|their|his|her)\s+(?:post|article|update|thought)",
+                    @"and others?\s+(?:share|shared|are)",
+                    @"shares?\s+(?:their|his|her)\s+thoughts?",
+                    @"commented on",
+                    @"reacted to",
+                    @"liked? (?:your|a)",
+                    @"trending (?:in your network|post)",
+                    @"top voices",
+                    @"new post(?:s)? from",
+
+                    // Network / profile notifications
+                    @"viewed your profile",
+                    @"appeared in \d+ search",
+                    @"people you may know",
+                    @"wants? to connect",
+                    @"invitation to connect",
+                    @"new connection",
+                    @"congratulate ",
+                    @"work anniversary",
+                    @"started a new (?:position|job|role)"
                 };
 
-                foreach (var pattern in linkedInAlertPatterns)
+                foreach (var pattern in linkedInNonApplicationPatterns)
                 {
                     if (Regex.IsMatch(content, pattern, RegexOptions.IgnoreCase))
                     {
                         signals.IsJobApplication = false;
                         signals.Signals.Add(new DetectedSignal
                         {
-                            SignalType = "linkedin_alert",
+                            SignalType = "linkedin_non_application",
                             Field = "isJobApplication",
                             Value = "false",
                             Confidence = 95,
                             Source = "content",
                             Pattern = pattern
                         });
-                        _logger.LogDebug($"  ✗ LinkedIn job alert detected: {pattern}");
+                        _logger.LogDebug($"  ✗ LinkedIn non-application email detected: {pattern}");
                         return;
                     }
                 }
