@@ -1,3 +1,4 @@
+using Google.Apis.Auth.OAuth2.Responses;
 using JobTrackerApi.Models;
 using Microsoft.Extensions.Options;
 using MongoDB.Driver;
@@ -111,13 +112,28 @@ namespace JobTrackerApi.Services
                 syncHistory.SyncCompletedAt = DateTime.UtcNow;
                 syncHistory.Errors.Add(ex.Message);
 
-                // Update connection status
+                // Update connection status. A revoked/expired refresh token
+                // (invalid_grant) can never recover on its own, so deactivate the
+                // connection to stop the scheduler retrying every cycle; the OAuth
+                // reconnect flow sets IsActive back to true.
+                var authExpired = IsInvalidGrant(ex);
+
                 var connection = await _authService.GetConnectionAsync(userId);
                 if (connection != null)
                 {
                     var connectionUpdate = Builders<UserEmailConnection>.Update
                         .Set(c => c.LastSyncStatus, "failed")
-                        .Set(c => c.SyncErrorMessage, ex.Message);
+                        .Set(c => c.SyncErrorMessage, authExpired
+                            ? "Gmail authorization expired or was revoked — please reconnect your Gmail account."
+                            : ex.Message);
+
+                    if (authExpired)
+                    {
+                        connectionUpdate = connectionUpdate.Set(c => c.IsActive, false);
+                        _logger.LogWarning(
+                            "Deactivated Gmail connection for user {UserId} (invalid_grant); reconnection required",
+                            userId);
+                    }
 
                     await _connectionCollection.UpdateOneAsync(c => c.Id == connection.Id, connectionUpdate);
                 }
@@ -129,6 +145,10 @@ namespace JobTrackerApi.Services
 
             return syncHistory;
         }
+
+        private static bool IsInvalidGrant(Exception ex) =>
+            (ex is TokenResponseException tre && tre.Error?.Error == "invalid_grant") ||
+            (ex.InnerException is TokenResponseException inner && inner.Error?.Error == "invalid_grant");
 
         // Sync all users (for background job)
         public async Task<List<EmailSyncHistory>> SyncAllUsersAsync()
