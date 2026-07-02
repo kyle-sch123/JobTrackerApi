@@ -35,6 +35,7 @@ namespace JobTrackerApi.Services
         // Strong indicators of application RESPONSE emails
         private readonly string[] _applicationResponseIndicators = {
             "application received", "we received your application", "thank you for applying",
+            "we have received your application", "your application was sent",
             "your application has been", "your application for", "application confirmation",
             "has been sent", "has been submitted", "successfully applied",
             "interview invitation", "schedule an interview", "phone screen", "video interview",
@@ -45,9 +46,11 @@ namespace JobTrackerApi.Services
 
         // Indicators of job alerts/newsletters (false positives)
         private readonly string[] _nonApplicationIndicators = {
-            "job alert", "jobs you may like", "jobs you might like", "recommended jobs",
-            "job recommendations", "new jobs", "weekly jobs", "daily jobs", "job digest",
-            "career advice", "salary alert", "matching jobs", "saved search", "newsletter"
+            "job alert", "advert alert", "jobs you may like", "jobs you might like",
+            "recommended jobs", "job recommendations", "new jobs", "weekly jobs",
+            "daily jobs", "job digest", "weekly job update", "explore new jobs",
+            "career advice", "salary alert", "matching jobs", "saved search", "newsletter",
+            "has a new post for you", "share their thoughts"
         };
 
         public JobRelatedEmailFilter(ILogger<JobRelatedEmailFilter> logger)

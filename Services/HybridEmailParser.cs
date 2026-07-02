@@ -101,7 +101,19 @@ namespace JobTrackerApi.Services
 
         private ParsingStrategy DetermineParsingStrategy(EmailSignals signals)
         {
-            var missingCoreFields = string.IsNullOrEmpty(signals.CompanyName) || string.IsNullOrEmpty(signals.Position);
+            // A recognized job-board/ATS template is authoritative: the rule parser
+            // already extracted everything that sender's emails contain, so an LLM
+            // pass can only spend money rediscovering (or hallucinating) the same
+            // fields. This includes PNet-style confirmations where the employer
+            // name is genuinely absent — no parser can extract what isn't there.
+            if (signals.FromRecognizedTemplate)
+            {
+                return ParsingStrategy.RuleBasedOnly;
+            }
+
+            var missingCoreFields =
+                (string.IsNullOrEmpty(signals.CompanyName) && !signals.CompanyKnownAbsent) ||
+                string.IsNullOrEmpty(signals.Position);
             if (missingCoreFields)
             {
                 return signals.OverallConfidence >= MEDIUM_CONFIDENCE_THRESHOLD
@@ -138,7 +150,9 @@ namespace JobTrackerApi.Services
                 InterviewType = signals.InterviewType,
                 Confidence = signals.OverallConfidence,
                 ExtractionMethod = "rule-based",
-                IsJobApplication = signals.IsJobApplication
+                IsJobApplication = signals.IsJobApplication,
+                SourceJobBoard = signals.SourceJobBoard,
+                EmailType = "application_response"
             };
         }
 

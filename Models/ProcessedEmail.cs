@@ -105,6 +105,9 @@ namespace JobTrackerApi.Models
         [BsonElement("emailType")]
         public string? EmailType { get; set; } // application_response | job_alert | newsletter | marketing_promotional | other
 
+        [BsonElement("sourceJobBoard")]
+        public string? SourceJobBoard { get; set; } // Job board/ATS the email came through (e.g. "PNet")
+
         public bool IsJobApplication { get; set; } = true;
         public string? Description { get; set; }
     }

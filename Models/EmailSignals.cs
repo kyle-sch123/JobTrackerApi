@@ -29,6 +29,18 @@ namespace JobTrackerApi.Models
         // Whether this appears to be an actual job application email (not newsletter/alert)
         public bool IsJobApplication { get; set; } = true;
 
+        // Set when the email matched a known job-board/ATS template. The parser
+        // has already extracted everything the sender's template contains, so an
+        // LLM pass cannot add information — only cost.
+        public bool FromRecognizedTemplate { get; set; }
+
+        // The employer's name is genuinely not present in the email (job boards
+        // like PNet hide the advertiser). Distinct from "extraction failed".
+        public bool CompanyKnownAbsent { get; set; }
+
+        // Which job board / ATS the email came through (e.g. "PNet", "LinkedIn").
+        public string? SourceJobBoard { get; set; }
+
         // Detected signals (for transparency)
         public List<DetectedSignal> Signals { get; set; } = new();
 
