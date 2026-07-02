@@ -87,6 +87,15 @@ namespace JobTrackerApi.Services
                 score += 1;
             }
 
+            // A subject that names an application or interview is near-certainly
+            // about the recipient's own candidacy (e.g. a reply like
+            // "Re: Following Up on … Application" from a company domain), even when
+            // the sender carries no other signal.
+            if (ContainsStrongSubjectKeyword(subject))
+            {
+                score += 2;
+            }
+
             // Check sender domain for job-related patterns
             if (IsJobRelatedDomain(email.FromEmail))
             {
@@ -114,6 +123,19 @@ namespace JobTrackerApi.Services
             var isJobRelated = score >= 2;
             _logger.LogDebug($"Email job-related score={score} result={isJobRelated}: {subject}");
             return isJobRelated;
+        }
+
+        // Deliberately narrow: "offer"/"position"/"role" appear in too much
+        // marketing mail to be strong on their own.
+        private static readonly string[] _strongSubjectKeywords = { "application", "interview" };
+
+        private bool ContainsStrongSubjectKeyword(string? subject)
+        {
+            if (string.IsNullOrEmpty(subject))
+                return false;
+
+            var lowerSubject = subject.ToLowerInvariant();
+            return _strongSubjectKeywords.Any(k => ContainsKeyword(lowerSubject, k));
         }
 
         private bool ContainsJobKeywords(string? text)

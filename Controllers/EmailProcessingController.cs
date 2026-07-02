@@ -309,8 +309,8 @@ namespace JobTrackerApi.Controllers
                     email.ExtractedData.Confidence = 100; // User approval = 100% confidence
                 }
 
-                // Force process with high confidence
-                var result = await _processingService.ProcessEmailWithHybridAsync(email, forceProcess: true);
+                // Approve from the stored/overridden extraction (no re-parse).
+                var result = await _processingService.ApproveEmailAsync(email);
 
                 return Ok(new
                 {

@@ -116,8 +116,15 @@ namespace JobTrackerApi.Services
                     result.Action = "auto_processed";
                     await AutoProcessApplication(email, extractedData, result);
                 }
-                else if (_hybridParser.RequiresReview(extractedData.Confidence))
+                else
                 {
+                    // Everything reaching this point was classified as a genuine
+                    // application response (non-applications returned at Step 2), so
+                    // low confidence means the extraction is incomplete — not that
+                    // the email is junk. Job-board confirmations (PNet, Placement
+                    // Partner, …) often omit the employer name, which caps confidence
+                    // below the review threshold; queue them for user review instead
+                    // of silently ignoring them.
                     result.Action = "requires_review";
                     result.Message = "Extracted data requires user review";
 
@@ -125,16 +132,6 @@ namespace JobTrackerApi.Services
                         .Set(e => e.ProcessingStatus, "requires_review");
 
                     await _processedEmailCollection.UpdateOneAsync(e => e.Id == email.Id, reviewUpdate);
-                }
-                else
-                {
-                    result.Action = "low_confidence";
-                    result.Message = "Confidence too low for automatic processing";
-
-                    var ignoreUpdate = Builders<ProcessedEmail>.Update
-                        .Set(e => e.ProcessingStatus, "ignored");
-
-                    await _processedEmailCollection.UpdateOneAsync(e => e.Id == email.Id, ignoreUpdate);
                 }
 
                 result.Success = true;
@@ -152,6 +149,52 @@ namespace JobTrackerApi.Services
                     .Set(e => e.ProcessingStatus, "failed");
 
                 await _processedEmailCollection.UpdateOneAsync(e => e.Id == email.Id, failedUpdate);
+            }
+
+            return result;
+        }
+
+        // Approve a reviewed email using its stored (or user-overridden) extraction.
+        // Unlike ProcessEmailWithHybridAsync(forceProcess: true) this does NOT re-run
+        // the parser: re-parsing costs an LLM call and would discard any fields the
+        // user corrected in the review UI.
+        public async Task<ProcessingResult> ApproveEmailAsync(ProcessedEmail email)
+        {
+            var extractedData = email.ExtractedData;
+            if (extractedData == null)
+            {
+                // Never parsed (approved straight from a skipped state) — run the
+                // full pipeline.
+                return await ProcessEmailWithHybridAsync(email, forceProcess: true);
+            }
+
+            var result = new ProcessingResult
+            {
+                EmailId = email.Id!,
+                Success = false,
+                ExtractedData = extractedData,
+                Confidence = extractedData.Confidence,
+                ExtractionMethod = extractedData.ExtractionMethod
+            };
+
+            try
+            {
+                // Persist the (possibly user-overridden) extraction before creating
+                // the application from it.
+                var update = Builders<ProcessedEmail>.Update
+                    .Set(e => e.ExtractedData, extractedData)
+                    .Set(e => e.AiParsed, true);
+
+                await _processedEmailCollection.UpdateOneAsync(e => e.Id == email.Id, update);
+
+                result.Action = "auto_processed";
+                await AutoProcessApplication(email, extractedData, result);
+                result.Success = true;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, $"❌ Failed to approve email {email.GmailMessageId}");
+                result.Message = ex.Message;
             }
 
             return result;

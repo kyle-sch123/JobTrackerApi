@@ -63,11 +63,26 @@ namespace JobTrackerApi.Services
 
                 var listRequest = service.Users.Messages.List("me");
                 listRequest.Q = query;
-                listRequest.MaxResults = 50; // Fetch up to 50 emails per sync
+                listRequest.MaxResults = 50; // Page size
 
-                var messages = await listRequest.ExecuteAsync();
+                // Page through the full result set (bounded) instead of taking only
+                // the first page. LastSyncAt advances after every successful sync, so
+                // any message beyond a single page would otherwise be skipped forever.
+                const int maxMessagesPerSync = 500;
+                var messageRefs = new List<Message>();
+                string? pageToken = null;
+                do
+                {
+                    listRequest.PageToken = pageToken;
+                    var page = await listRequest.ExecuteAsync();
+                    if (page.Messages != null)
+                    {
+                        messageRefs.AddRange(page.Messages);
+                    }
+                    pageToken = page.NextPageToken;
+                } while (!string.IsNullOrEmpty(pageToken) && messageRefs.Count < maxMessagesPerSync);
 
-                if (messages.Messages == null || messages.Messages.Count == 0)
+                if (messageRefs.Count == 0)
                 {
                     _logger.LogInformation($"No new emails found for user {userId}");
                     return new List<ProcessedEmail>();
@@ -75,7 +90,7 @@ namespace JobTrackerApi.Services
 
                 var processedEmails = new List<ProcessedEmail>();
 
-                foreach (var message in messages.Messages)
+                foreach (var message in messageRefs)
                 {
                     try
                     {
@@ -241,7 +256,10 @@ namespace JobTrackerApi.Services
             // Combine with OR
             var mainQuery = string.Join(" OR ", queries);
 
-            mainQuery += " category:primary in:inbox";
+            // Include the Updates tab: ATS and job-board mail (application
+            // confirmations, interview invites) is frequently categorised there
+            // rather than Primary. Promotions/Social stay excluded.
+            mainQuery += " in:inbox (category:primary OR category:updates)";
 
             // Add date filter if provided
             if (since.HasValue)
