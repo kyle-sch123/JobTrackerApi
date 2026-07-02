@@ -9,8 +9,9 @@
   <ItemGroup>
     <PackageReference Include="DotNetEnv" Version="3.1.1" />
     <PackageReference Include="FirebaseAdmin" Version="3.4.0" />
-    <PackageReference Include="Google.Apis.Auth" Version="1.72.0" />
-    <PackageReference Include="Google.Apis.Auth.AspNetCore3" Version="1.72.0" />
+    <PackageReference Include="Google.Apis.Auth" Version="1.75.0" />
+    <PackageReference Include="Google.Apis.Auth.AspNetCore3" Version="1.75.0" />
+    <PackageReference Include="Google.Apis.Calendar.v3" Version="1.75.0.4182" />
     <PackageReference Include="Google.Apis.Gmail.v1" Version="1.70.0.3833" />
     <PackageReference Include="Hangfire.AspNetCore" Version="1.8.22" />
     <PackageReference Include="Hangfire.Core" Version="1.8.22" />

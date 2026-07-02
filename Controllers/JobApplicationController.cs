@@ -9,9 +9,13 @@ namespace JobTrackerApi.Controllers;
 public class JobApplicationController : BaseController
 {
     private readonly JobApplicationService _jobApplicationService;
+    private readonly CalendarService _calendarService;
 
-    public JobApplicationController(JobApplicationService jobApplicationService) =>
+    public JobApplicationController(JobApplicationService jobApplicationService, CalendarService calendarService)
+    {
         _jobApplicationService = jobApplicationService;
+        _calendarService = calendarService;
+    }
 
     // GET: Get all job applications for the authenticated user
     [HttpGet]
@@ -119,6 +123,31 @@ public class JobApplicationController : BaseController
 
         // Preserve JobNumber if it exists
         updatedJobApplication.jobNumber = existingJobApplication.jobNumber;
+
+        // CalendarEventId is server-owned — never take it from the client body.
+        updatedJobApplication.CalendarEventId = existingJobApplication.CalendarEventId;
+
+        var interviewChanged =
+            existingJobApplication.InterviewDate != updatedJobApplication.InterviewDate ||
+            existingJobApplication.InterviewType != updatedJobApplication.InterviewType ||
+            existingJobApplication.InterviewLocation != updatedJobApplication.InterviewLocation;
+
+        if (interviewChanged)
+        {
+            if (updatedJobApplication.InterviewDate == null)
+            {
+                if (!string.IsNullOrEmpty(existingJobApplication.CalendarEventId))
+                {
+                    await _calendarService.DeleteInterviewEventAsync(userId, existingJobApplication.CalendarEventId);
+                }
+                updatedJobApplication.CalendarEventId = null;
+            }
+            else
+            {
+                updatedJobApplication.CalendarEventId =
+                    await _calendarService.SyncInterviewEventAsync(userId, updatedJobApplication);
+            }
+        }
 
         await _jobApplicationService.UpdateAsync(id, updatedJobApplication);
 

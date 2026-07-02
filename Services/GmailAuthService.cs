@@ -12,6 +12,13 @@ namespace JobTrackerApi.Services
 {
     public class GmailAuthService
     {
+        // Scopes granted on every (re)connect. Adding calendar.events here means
+        // existing users must reconnect once to pick it up — ExchangeCodeForTokensAsync
+        // always overwrites the stored Scopes list with this full set.
+        public const string GmailReadonlyScope = "https://www.googleapis.com/auth/gmail.readonly";
+        public const string CalendarEventsScope = "https://www.googleapis.com/auth/calendar.events";
+        private static readonly string[] Scopes = { GmailReadonlyScope, CalendarEventsScope };
+
         private readonly IMongoCollection<UserEmailConnection> _connectionCollection;
         private readonly IConfiguration _configuration;
         private readonly IHttpClientFactory _httpClientFactory;
@@ -75,7 +82,6 @@ namespace JobTrackerApi.Services
         // Generate OAuth authorization URL
         public string GetAuthorizationUrl(string userId, string state)
         {
-            var scopes = new[] { "https://www.googleapis.com/auth/gmail.readonly" };
             // Encode userId into the state so it is available on callback without requiring frontend to pass it
             var stateObj = new { userId = userId ?? "", state = state ?? "" };
             var stateJson = JsonSerializer.Serialize(stateObj);
@@ -85,7 +91,7 @@ namespace JobTrackerApi.Services
                 $"client_id={Uri.EscapeDataString(_clientId)}&" +
                 $"redirect_uri={Uri.EscapeDataString(_redirectUri)}&" +
                 $"response_type=code&" +
-                $"scope={Uri.EscapeDataString(string.Join(" ", scopes))}&" +
+                $"scope={Uri.EscapeDataString(string.Join(" ", Scopes))}&" +
                 $"access_type=offline&" +
                 $"prompt=consent&" +
                 $"state={Uri.EscapeDataString(stateBase64)}";
@@ -105,7 +111,7 @@ namespace JobTrackerApi.Services
                         ClientId = _clientId,
                         ClientSecret = _clientSecret
                     },
-                    Scopes = new[] { "https://www.googleapis.com/auth/gmail.readonly" }
+                    Scopes = Scopes
                 });
 
                 var tokenResponse = await flow.ExchangeCodeForTokenAsync(
@@ -135,7 +141,7 @@ namespace JobTrackerApi.Services
                         ? Protect(tokenResponse.RefreshToken)
                         : (existingConnection?.RefreshToken ?? ""),
                     TokenExpiry = DateTime.UtcNow.AddSeconds(tokenResponse.ExpiresInSeconds ?? 3600),
-                    Scopes = new List<string> { "https://www.googleapis.com/auth/gmail.readonly" },
+                    Scopes = Scopes.ToList(),
                     IsActive = true,
                     ConnectedAt = existingConnection?.ConnectedAt ?? DateTime.UtcNow
                 };

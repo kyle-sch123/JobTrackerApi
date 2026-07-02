@@ -160,7 +160,8 @@ namespace JobTrackerApi.Controllers
                     email = connection.Email,
                     connectedAt = connection.ConnectedAt,
                     lastSyncAt = connection.LastSyncAt,
-                    lastSyncStatus = connection.LastSyncStatus
+                    lastSyncStatus = connection.LastSyncStatus,
+                    hasCalendarScope = connection.Scopes.Contains(GmailAuthService.CalendarEventsScope)
                 });
             }
             catch (Exception ex)

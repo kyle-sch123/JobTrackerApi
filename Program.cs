@@ -126,6 +126,7 @@ builder.Services.AddSingleton<JobApplicationService>();
 builder.Services.AddSingleton<GmailAuthService>();
 builder.Services.AddSingleton<GmailEmailService>();
 builder.Services.AddSingleton<EmailSyncService>();
+builder.Services.AddSingleton<CalendarService>();
 
 // Add AI processing services
 builder.Services.AddSingleton<ClaudeEmailParserService>();

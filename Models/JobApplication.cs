@@ -55,6 +55,12 @@ public class JobApplication
     [BsonElement("interviewType")]
     public string? InterviewType { get; set; } // "phone", "video", "onsite"
 
+    [BsonElement("interviewLocation")]
+    public string? InterviewLocation { get; set; } // Address, or a video call link
+
+    [BsonElement("calendarEventId")]
+    public string? CalendarEventId { get; set; } // Google Calendar event synced for InterviewDate
+
     [BsonElement("salaryRange")]
     public string? SalaryRange { get; set; }
 
